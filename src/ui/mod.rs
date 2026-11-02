@@ -1,5 +1,6 @@
 //! The widgets.
 
+pub mod alerts;
 pub mod chart;
 pub mod book_templates;
 pub mod chart_settings;

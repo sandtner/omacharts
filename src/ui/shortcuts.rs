@@ -48,6 +48,7 @@ pub const BINDINGS: &[Binding] = &[
     global("win.find", &["<Ctrl>k", "<Ctrl>f"]),
     global("win.watchlist", &["<Ctrl>b"]),
     global("win.preferences", &["<Ctrl>comma"]),
+    global("win.alerts", &["<Ctrl><Shift>a"]),
     global("chart.indicators", &["<Ctrl>i"]),
     // A letter, because Shift and punctuation together is a trap. GTK
     // matches the keyval the key produces *after* modifiers, and shifting

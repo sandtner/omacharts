@@ -150,6 +150,7 @@ const SHORTCUT_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl+Shift+I", "Add an indicator"),
             ("Ctrl+Shift+S", "Chart settings"),
             ("Ctrl+,", "Preferences"),
+            ("Ctrl+Shift+A", "Alerts"),
             ("F10", "Main menu"),
             ("? · Ctrl+?", "This list"),
             ("Ctrl+Q", "Quit"),
@@ -4675,6 +4676,7 @@ impl Window {
         let books = gio::Menu::new();
         shortcuts::append(&books, "New chartbook", "win.new-chartbook");
         menu.append_section(None, &books);
+        shortcuts::append(&menu, "Alerts", "win.alerts");
         shortcuts::append(&menu, "Preferences", "win.preferences");
         shortcuts::append(&menu, "Keyboard Shortcuts", "win.shortcuts");
         let menu_button = gtk::MenuButton::new();
@@ -4955,6 +4957,11 @@ impl Window {
         let this = self.clone();
         preferences.connect_activate(move |_, _| this.open_preferences());
         self.window.add_action(&preferences);
+
+        let alerts = gio::SimpleAction::new("alerts", None);
+        let this = self.clone();
+        alerts.connect_activate(move |_, _| crate::ui::alerts::present(&this));
+        self.window.add_action(&alerts);
 
         let shortcuts = gio::SimpleAction::new("shortcuts", None);
         let this = self.clone();
