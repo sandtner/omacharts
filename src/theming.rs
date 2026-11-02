@@ -144,8 +144,14 @@ impl Theming {
     /// no Omarchy theme there is no bar to draw in, and the window's theme
     /// stands in.
     pub fn bar_widget_ink(&self) -> Ink {
-        let theme = self.omarchy.clone().unwrap_or_else(|| self.theme());
+        let theme = self.bar_widget_theme();
         theme.ink(&self.bar_scheme_for(&theme))
+    }
+
+    /// The theme the bar widget is drawn from: the desktop's, when there is
+    /// one, since the widget sits in the desktop's bar.
+    pub fn bar_widget_theme(&self) -> Theme {
+        self.omarchy.clone().unwrap_or_else(|| self.theme())
     }
 
     pub fn theme_id(&self) -> &str {

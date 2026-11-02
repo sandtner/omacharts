@@ -182,10 +182,12 @@ pub fn dispatch(
             // The levels on the charts, and nothing else: an alert is not
             // the arrangement, and rebuilding it for one would be the
             // stutter the rule about refreshing what changed is there for.
-            if outcome.is_ok()
-                && let Some(live) = live
-            {
-                live.adopt_alerts();
+            // The window tells the bar widget itself; with no window, this is
+            // the only thing that will, short of its next poll.
+            match (outcome.is_ok(), live) {
+                (true, Some(live)) => live.adopt_alerts(),
+                (true, None) if !cfg!(test) => crate::bar_plugin::notify_changed(),
+                _ => {}
             }
             outcome
         }

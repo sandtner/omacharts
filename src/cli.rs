@@ -845,9 +845,14 @@ pub fn watchlist_json(store: &Store, refresh_first: bool, live: Option<&dyn Live
         }
         out.push_str("]}");
     }
+    // How many alerts are waiting, for the widget's dot. Counted after the
+    // check above, so a poll that fired one answers with it gone.
+    let alerts = store.alerts();
+    let armed = alerts.iter().filter(|a| a.is_armed()).count();
     out.push_str(&format!(
-        "],\"colors\":{},\"updatedAt\":{}}}",
+        "],\"colors\":{},\"alerts\":{{\"armed\":{armed},\"fired\":{}}},\"updatedAt\":{}}}",
         colors_json(store),
+        alerts.len() - armed,
         chrono::Utc::now().timestamp()
     ));
     out
@@ -889,18 +894,23 @@ fn resolver(live: Option<&dyn Live>) -> Rc<SearchIndex> {
 /// files and a handful of settings rows, the same reads the window makes when
 /// it starts.
 fn colors_json(store: &Store) -> String {
-    let ink = crate::theming::Theming::load(store).bar_widget_ink();
+    let theming = crate::theming::Theming::load(store);
+    let ink = theming.bar_widget_ink();
+    // The amber the charts draw alert levels in, from the theme the widget's
+    // ink comes from, for the dot that says alerts are armed.
+    let alert = omacharts_engine::Paint::preset(omacharts_engine::Preset::Amber).hex(&theming.bar_widget_theme());
     let tag = |tag: &omacharts_engine::Tag| {
         format!("{{\"fill\":{},\"label\":{}}}", json_string(&tag.fill), json_string(&tag.label))
     };
     format!(
-        "{{\"text\":{},\"muted\":{},\"up\":{},\"down\":{},\"flat\":{},\"hover\":{},\"tags\":{{\"up\":{},\"down\":{},\"flat\":{}}}}}",
+        "{{\"text\":{},\"muted\":{},\"up\":{},\"down\":{},\"flat\":{},\"hover\":{},\"alert\":{},\"tags\":{{\"up\":{},\"down\":{},\"flat\":{}}}}}",
         json_string(&ink.text),
         json_string(&ink.muted),
         json_string(&ink.up),
         json_string(&ink.down),
         json_string(&ink.flat),
         json_string(&ink.hover),
+        json_string(&alert),
         tag(&ink.up_tag),
         tag(&ink.down_tag),
         tag(&ink.flat_tag),
@@ -940,6 +950,15 @@ fn entry_json(store: &Store, provider: &dyn Provider, instrument: &Instrument) -
                 tail.iter().map(|(_, close)| format!("{close:.6}")).collect();
             fields.push_str(&format!(",\"spark\":[{}]", points.join(",")));
         }
+    }
+    // The armed alerts on this row's symbol, for the dot beside its ticker.
+    let alerts = store
+        .alerts()
+        .iter()
+        .filter(|a| a.is_armed() && a.is_for(&instrument.symbol, instrument.suffix.as_deref()))
+        .count();
+    if alerts > 0 {
+        fields.push_str(&format!(",\"alerts\":{alerts}"));
     }
     match quote {
         // A quote we do not have is absent rather than zero. Zero is a price.

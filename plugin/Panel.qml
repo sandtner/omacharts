@@ -41,6 +41,7 @@ Panel {
     id: dummyService
     property var sections: []
     property var colors: null
+    property int alertsArmed: 0
     property string lastError: ""
     property bool missing: false
     property bool refreshing: false
@@ -117,17 +118,34 @@ Panel {
     iconComponent: Component {
       Item {
         OmachartsIcon {
+          id: mark
           anchors.centerIn: parent
           iconSize: Style.space(13)
           color: root.foreground
         }
+        // A dot on the mark's corner while any price alert is armed, in the
+        // bar's own colour for "something is on" — the one its indicators
+        // light up in. The charts' amber was the first choice and vanished:
+        // on a warm theme it is the bar's own text colour give or take.
+        Rectangle {
+          visible: root.service.alertsArmed > 0
+          width: Math.max(5, Math.round(mark.iconSize * 0.6))
+          height: width
+          radius: width / 2
+          color: Color.bar.active
+          x: mark.x + mark.width - width * 0.55
+          y: mark.y - height * 0.45
+        }
       }
     }
-    tooltipText: root.service.refreshing
+    tooltipText: (root.service.refreshing
       ? "Updating the watchlist"
       : (root.headline
         ? root.headline.display + " " + Model.formatPercent(root.headline.changePct)
-        : "Omacharts watchlist")
+        : "Omacharts watchlist"))
+      + (root.service.alertsArmed > 0
+        ? " · " + root.service.alertsArmed + (root.service.alertsArmed === 1 ? " alert armed" : " alerts armed")
+        : "")
     onPressed: function (buttonCode) {
       if (buttonCode === Qt.RightButton || buttonCode === Qt.MiddleButton) root.service.refresh()
       else root.toggle()
@@ -353,14 +371,33 @@ Panel {
                 Layout.fillWidth: true
                 Layout.minimumWidth: 0
                 spacing: 0
-                Text {
+                RowLayout {
                   Layout.fillWidth: true
-                  text: modelData.display || ""
-                  elide: Text.ElideRight
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.space(13)
-                  font.bold: true
-                  color: root.text
+                  spacing: Style.space(5)
+                  Text {
+                    Layout.fillWidth: !(modelData.alerts > 0)
+                    Layout.minimumWidth: 0
+                    text: modelData.display || ""
+                    elide: Text.ElideRight
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.space(13)
+                    font.bold: true
+                    color: root.text
+                  }
+                  // An armed alert on this symbol: the same dot the icon in
+                  // the bar wears, so the two are read as one thing.
+                  Rectangle {
+                    visible: modelData.alerts > 0
+                    Layout.alignment: Qt.AlignVCenter
+                    implicitWidth: Style.space(7)
+                    implicitHeight: implicitWidth
+                    radius: implicitWidth / 2
+                    color: Color.bar.active
+                  }
+                  Item {
+                    visible: modelData.alerts > 0
+                    Layout.fillWidth: true
+                  }
                 }
                 Text {
                   Layout.fillWidth: true

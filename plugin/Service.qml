@@ -15,6 +15,7 @@ Item {
   property var settings: ({})
   property var sections: []
   property var colors: null
+  property int alertsArmed: 0
   property string lastError: ""
   // True once a poll could not start omacharts at all: the package has been
   // removed and this folder outlived it, so the panel hides rather than
@@ -142,6 +143,7 @@ Item {
       // last quotes on screen rather than blanking the bar.
       root.sections = parsed.sections
       if (parsed.colors) root.colors = parsed.colors
+      root.alertsArmed = parsed.alertsArmed
       root.lastError = ""
       root.updatedAt = Date.now()
     }

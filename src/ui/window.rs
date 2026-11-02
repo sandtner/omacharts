@@ -8156,8 +8156,10 @@ impl Window {
         self.refresh_alert_levels();
     }
 
-    /// Show every chart the armed alerts on its symbol.
+    /// Show every chart the armed alerts on its symbol, and the bar widget
+    /// how many there are.
     pub fn refresh_alert_levels(&self) {
+        crate::bar_plugin::notify_changed();
         for pane in self.panes.borrow().iter() {
             let instrument = pane.instrument.borrow().clone();
             if let Some(instrument) = instrument {

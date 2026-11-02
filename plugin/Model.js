@@ -15,6 +15,9 @@ function parse(text) {
       // chosen in the window, and sent with the data, so the bar and the
       // window cannot disagree about what up looks like.
       colors: parsed.colors || null,
+      // How many price alerts are armed, for the dot on the icon. Absent
+      // from an older app, which reads as none.
+      alertsArmed: parsed.alerts && parsed.alerts.armed ? parsed.alerts.armed : 0,
       updatedAt: parsed.updatedAt || 0,
       error: parsed.error || ""
     }
@@ -47,6 +50,7 @@ function rows(sections) {
         changePct: entry.changePct,
         kind: entry.kind || "",
         hasQuote: entry.last !== null && entry.last !== undefined,
+        alerts: entry.alerts || 0,
         spark: Array.isArray(entry.spark) ? entry.spark : []
       })
     }
@@ -134,7 +138,9 @@ function palette(colors, text, ground) {
     up: pick("up", written),
     down: pick("down", written),
     flat: pick("flat", pick("muted", written)),
-    hover: pick("hover", ground)
+    hover: pick("hover", ground),
+    // The alert dot. An older app sends none, and down stands in.
+    alert: pick("alert", pick("down", written))
   }
   out.tags = { up: tag("up", out.up), down: tag("down", out.down), flat: tag("flat", out.flat) }
   return out
