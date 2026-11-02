@@ -148,6 +148,9 @@ pub fn present(window: &Rc<Window>, store: &Rc<Store>, pane: &Rc<ChartPane>) {
     };
     let editor = style_editor(window, kind, drawing.style(&configs_now).clone(), on_style.clone());
     page.add(&editor.group);
+    if kind.is_position() {
+        page.add(&sizing_group(window, store, &view));
+    }
 
     // A figure's words are a subject of their own, behind a tab. A text
     // drawing *is* its words, and `style_editor` has already put the three
@@ -575,6 +578,7 @@ fn describe(kind: Kind, style: &Style) -> String {
             };
             format!("{}, {:.0}px{face}", name_of(&style.text.colour), style.text.clamped_size())
         }
+        Kind::Position => format!("zones at {:.0}%", style.alpha * 100.0),
     }
 }
 
@@ -831,6 +835,10 @@ fn style_editor(window: &Rc<Window>, kind: Kind, current: Style, on_style: Rc<dy
                 shows.push(show);
             }
         }
+        // Its colours are the candles' up and down, so there is no look to
+        // choose: what a position has instead is its prices and the
+        // account, which the properties dialog puts in a group of its own.
+        Kind::Position => {}
     }
 
     // A shape's words, in a group of their own. The text kind's three rows
@@ -1509,6 +1517,7 @@ pub fn swatch(theme: &Theme, kind: Kind, style: &Style) -> gtk::DrawingArea {
                 cr.rectangle(2.0, (h / 2.0).round() - 2.0, w - 4.0, 4.0);
                 let _ = cr.fill();
             }
+            Kind::Position => position_zones(cr, &theme, (1.0, 1.0, w - 2.0, h - 2.0)),
         }
     });
     area
@@ -1657,7 +1666,114 @@ fn draw_preview_figure(
             let box_at = (0.0, (h - box_h) / 2.0, w, box_h);
             preview_text(cr, box_at, Kind::Rect, theme, style, text, scale);
         }
+        Kind::Position => position_zones(cr, theme, (w * 0.2, h * 0.15, w * 0.6, h * 0.7)),
     }
+}
+
+/// A position in miniature: the target's zone over the stop's, in the
+/// theme's up and down.
+fn position_zones(cr: &gtk::cairo::Context, theme: &Theme, (x, y, w, h): (f64, f64, f64, f64)) {
+    let mid = y + h * 0.6;
+    colors::set_source_alpha(cr, &Paint::preset(Preset::Up).hex(theme), 0.45);
+    cr.rectangle(x, y, w, mid - y);
+    let _ = cr.fill();
+    colors::set_source_alpha(cr, &Paint::preset(Preset::Down).hex(theme), 0.45);
+    cr.rectangle(x, mid, w, y + h - mid);
+    let _ = cr.fill();
+}
+
+/// A position's prices, and the account every position is sized against.
+///
+/// The prices are this drawing's; the account is everybody's, which the
+/// group's description says, because a field that quietly changes every
+/// other position on every chart is a surprise.
+fn sizing_group(window: &Rc<Window>, store: &Rc<Store>, view: &Rc<crate::ui::chart::ChartView>) -> adw::PreferencesGroup {
+    use omacharts_engine::position::Stake;
+    let group = adw::PreferencesGroup::new();
+    group.set_title("Sizing");
+    group.set_description(Some("The account and the risk are shared by every position."));
+    let Some(drawing) = view.selected_drawing() else { return group };
+
+    let price_row = |title: &str, value: f64, set: fn(&mut omacharts_engine::Drawing, f64)| {
+        let row = adw::EntryRow::new();
+        row.set_title(title);
+        row.set_text(&format!("{value}"));
+        row.set_show_apply_button(true);
+        let view = view.clone();
+        row.connect_apply(move |row| match row.text().trim().replace(',', ".").parse::<f64>() {
+            Ok(price) if price.is_finite() && price > 0.0 => {
+                row.remove_css_class("error");
+                view.edit_selected(move |d| set(d, price));
+            }
+            _ => row.add_css_class("error"),
+        });
+        row
+    };
+    group.add(&price_row("Entry", drawing.from.price, |d, p| {
+        if d.stop.is_none() {
+            d.stop = Some(d.stop_price());
+        }
+        d.from.price = p;
+    }));
+    group.add(&price_row("Target", drawing.to.price, |d, p| d.to.price = p));
+    group.add(&price_row("Stop", drawing.stop_price(), |d, p| d.stop = Some(p)));
+
+    let risk = store.position_risk();
+    let account_row = |title: &str, text: String, apply: Rc<dyn Fn(&str) -> bool>| {
+        let row = adw::EntryRow::new();
+        row.set_title(title);
+        row.set_text(&text);
+        row.set_show_apply_button(true);
+        row.connect_apply(move |row| match apply(row.text().trim()) {
+            true => row.remove_css_class("error"),
+            false => row.add_css_class("error"),
+        });
+        row
+    };
+    let change = {
+        let window = window.clone();
+        let store = store.clone();
+        move |edit: &dyn Fn(&mut omacharts_engine::position::Risk) -> bool| -> bool {
+            let mut risk = store.position_risk();
+            if !edit(&mut risk) {
+                return false;
+            }
+            window.set_position_risk(&store, risk);
+            true
+        }
+    };
+    let change = Rc::new(change);
+    group.add(&account_row("Account size", format!("{}", risk.account), {
+        let change = change.clone();
+        Rc::new(move |text: &str| {
+            let Ok(value) = text.replace(['\'', '_', ','], "").parse::<f64>() else { return false };
+            value.is_finite() && value > 0.0 && change(&|r| {
+                r.account = value;
+                true
+            })
+        })
+    }));
+    group.add(&account_row("Risk per trade (1% or an amount)", risk.stake.spell(), {
+        let change = change.clone();
+        Rc::new(move |text: &str| {
+            let Some(stake) = Stake::parse(text) else { return false };
+            change(&|r| {
+                r.stake = stake;
+                true
+            })
+        })
+    }));
+    group.add(&account_row("Currency", risk.currency.clone(), {
+        let change = change.clone();
+        Rc::new(move |text: &str| {
+            let currency = text.to_uppercase();
+            change(&|r| {
+                r.currency = currency.clone();
+                true
+            })
+        })
+    }));
+    group
 }
 
 /// The words a preview shows, in the style it is drawn in, placed in the

@@ -227,7 +227,7 @@ const SORT_COLUMNS: &[&str] = &["symbol", "last", "change", "change_pct", "none"
 /// list before the parser sees anything, so an alias the engine understands
 /// and the table does not is an alias nobody can use.
 const DRAWING_KINDS: &[&str] =
-    &["line", "hline", "arrow", "zigzag", "rect", "ellipse", "circle", "text"];
+    &["line", "hline", "arrow", "zigzag", "rect", "ellipse", "circle", "text", "position", "long", "short"];
 /// Where a figure's label sits in it.
 const PLACES: &[&str] = &[
     "center", "top", "bottom", "left", "right", "top-left", "top-right", "bottom-left",
@@ -902,6 +902,11 @@ pub const SURFACE: &[Noun] = &[
                     Flag::valued("from", "ANCHOR", ANCHOR),
                     Flag::valued("to", "ANCHOR", ANCHOR),
                     Flag::valued("point", "ANCHOR", POINT).repeating(),
+                    Flag::valued(
+                        "stop",
+                        "PRICE",
+                        "a position's stop; --from is its entry and --to its target (default: the target mirrored through the entry)",
+                    ),
                     Flag::valued("config", "N", "the configuration, 1-9, a drawing follows, or the one to configure"),
                     Flag::valued("color", "COLOUR", "a line's colour, or a box's edge: a preset name or #rrggbb"),
                     Flag::valued("width", "F", "a line's thickness in pixels, or a box's edge"),
@@ -1118,6 +1123,20 @@ pub const SURFACE: &[Noun] = &[
                 args: &[Arg::opt("STATE", "omit to read it").of(COLOURING)],
                 flags: &[],
                 example: "omacharts config bars monochrome",
+                json: true,
+                writes: true,
+                workspace: true,
+            },
+            Verb {
+                name: "risk",
+                about: "The account a position drawing is sized against, and how much of it one trade may lose; no flags reads it",
+                args: &[],
+                flags: &[
+                    Flag::valued("account", "AMOUNT", "what the account is worth"),
+                    Flag::valued("risk", "STAKE", "what one trade may lose: a percentage of the account, such as 1%, or an amount, such as 250"),
+                    Flag::valued("currency", "CODE", "the account's currency, such as CHF, for saying amounts back; empty for none"),
+                ],
+                example: "omacharts config risk --account 50000 --risk 1% --currency CHF",
                 json: true,
                 writes: true,
                 workspace: true,

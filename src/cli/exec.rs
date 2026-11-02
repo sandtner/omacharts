@@ -196,6 +196,7 @@ pub fn dispatch(
             outcome
         }
         ("config", "bars") => config_bars(store, m, json, live),
+        ("config", "risk") => config_risk(store, m, json),
 
         ("plugin", "status") => plugin_status(&caller.home(), json),
         ("plugin", "install") => plugin_install(&caller.home(), json),
@@ -1897,16 +1898,22 @@ fn chart_drawing(
         all
     };
 
+    let sizing = Sizing::of(store, &symbol, suffix.as_deref());
     if action == "list" {
         let listed = shown(store, &locals);
         return match as_json {
             true => Ok(format!(
                 "{{\"chart\":{pane},\"symbol\":{},\"shows_drawings\":{shows},\"sends_drawings\":{sends},\"drawings\":[{}]}}\n",
                 json!(spell(&symbol, suffix.as_deref())),
-                listed.iter().map(|d| drawing_json(d, &configs, zone).to_string()).collect::<Vec<_>>().join(",")
+                listed.iter().map(|d| drawing_json_sized(d, &configs, zone, &sizing).to_string()).collect::<Vec<_>>().join(",")
             )),
             false if listed.is_empty() => Ok(format!("nothing drawn on {}\n", spell(&symbol, suffix.as_deref()))),
-            false => Ok(listed.iter().map(|d| describe_drawing(d, &configs, zone)).collect::<Vec<_>>().join("\n") + "\n"),
+            false => Ok(listed
+                .iter()
+                .map(|d| sizing.line(d, describe_drawing(d, &configs, zone)))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n"),
         };
     }
 
@@ -1935,6 +1942,10 @@ fn chart_drawing(
                 .ok_or_else(|| Fault::usage(format!("--config is a number from 1 to {CONFIGURATIONS}, not {text:?}")))?,
         ),
     };
+    let stop = number(m, "stop")?;
+    if stop.is_some_and(|s| !s.is_finite() || s <= 0.0) {
+        return Err(Fault::usage("--stop is a price, more than zero".into()));
+    }
     let style = StyleEdits::read(m)?;
     let words = TextEdits::read(m)?;
     let scope = match arg(m, "scope") {
@@ -2000,7 +2011,11 @@ fn chart_drawing(
                     "`drawing add text` needs --text: a text drawing with nothing to say draws nothing".into(),
                 ));
             }
+            if stop.is_some() && !kind.is_position() {
+                return Err(Fault::usage("--stop is a position's; every other kind has no stop".into()));
+            }
             let mut drawing = Drawing::new(kind, from, to);
+            drawing.stop = stop;
             if !corners.is_empty() {
                 drawing.set_corners(corners.clone());
             }
@@ -2027,7 +2042,7 @@ fn chart_drawing(
                 };
                 drawing.id = id;
             }
-            format!("drew {}", describe_drawing(&drawing, &configs, zone))
+            format!("drew {}", sizing.line(&drawing, describe_drawing(&drawing, &configs, zone)))
         }
         "set" => {
             let Some(id) = id else {
@@ -2041,13 +2056,20 @@ fn chart_drawing(
                 && words.is_empty()
                 && scope.is_none()
                 && order.is_none()
+                && stop.is_none()
             {
                 return Err(Fault::usage(
-                    "nothing to set: give --from, --to, --point, --config, --scope, --order, --text, or a property".into(),
+                    "nothing to set: give --from, --to, --point, --stop, --config, --scope, --order, --text, or a property".into(),
                 ));
             }
             let mut drawing = find_drawing(store, &symbol, suffix.as_deref(), &locals, id)?;
             let was_local = drawing.is_local();
+            if let Some(stop) = stop {
+                if !drawing.kind.is_position() {
+                    return Err(Fault::usage(format!("--stop is a position's; #{id} is a {}", drawing.kind.key())));
+                }
+                drawing.move_grip(omacharts_engine::Grip::Stop, omacharts_engine::Anchor::new(drawing.from.ts, stop));
+            }
             // Through `move_grip` rather than straight onto the field, so a
             // text drawing's two anchors stay the one point they are.
             if let Some(from) = from {
@@ -2108,7 +2130,7 @@ fn chart_drawing(
                     write_locals(workspace, at, pane, &locals)?;
                 }
             }
-            format!("set {}", describe_drawing(&drawing, &configs, zone))
+            format!("set {}", sizing.line(&drawing, describe_drawing(&drawing, &configs, zone)))
         }
         "remove" => {
             let Some(id) = id else {
@@ -2310,6 +2332,53 @@ fn find_drawing(
 }
 
 fn drawing_json(d: &omacharts_engine::Drawing, configs: &omacharts_engine::Configurations, zone: Tz) -> Value {
+    let mut value = drawing_json_plain(d, configs, zone);
+    if d.kind.is_position() {
+        value["stop"] = json!(d.stop_price());
+    }
+    value
+}
+
+/// A drawing as JSON, with a position's plan worked out against the account.
+fn drawing_json_sized(
+    d: &omacharts_engine::Drawing,
+    configs: &omacharts_engine::Configurations,
+    zone: Tz,
+    sizing: &Sizing,
+) -> Value {
+    let mut value = drawing_json(d, configs, zone);
+    if let Some(plan) = d.plan(&sizing.risk, sizing.kind) {
+        value["plan"] = json!(plan);
+        value["plan"]["currency"] = json!(sizing.risk.currency);
+    }
+    value
+}
+
+/// What a position on a chart is sized with: the account, and what kind of
+/// instrument it is, which decides whether a part of a unit can be bought.
+struct Sizing {
+    risk: omacharts_engine::position::Risk,
+    kind: Option<omacharts_engine::InstrumentKind>,
+}
+
+impl Sizing {
+    fn of(store: &Store, symbol: &str, suffix: Option<&str>) -> Sizing {
+        Sizing {
+            risk: store.position_risk(),
+            kind: crate::inventory::everything().find(symbol, suffix).map(|i| i.kind),
+        }
+    }
+
+    /// The plan after a drawing's one line, for a position.
+    fn line(&self, drawing: &omacharts_engine::Drawing, described: String) -> String {
+        match drawing.plan(&self.risk, self.kind) {
+            Some(plan) => format!("{described}\n    {}", plan.describe(&self.risk, self.kind)),
+            None => described,
+        }
+    }
+}
+
+fn drawing_json_plain(d: &omacharts_engine::Drawing, configs: &omacharts_engine::Configurations, zone: Tz) -> Value {
     json!({
         "id": d.id,
         "kind": d.kind.key(),
@@ -2425,6 +2494,7 @@ fn describe_style(kind: omacharts_engine::DrawingKind, style: &omacharts_engine:
             format!("fill {} at {:.2}{edge}", style.fill.spell(), style.alpha)
         }
         Kind::Text => describe_text_style(style),
+        Kind::Position => format!("zones at {:.2}", style.alpha),
     }
 }
 
@@ -4395,6 +4465,48 @@ const COLOURED_BARS: &str = "coloured_bar_scheme";
 /// `config set bar_scheme theme-mono` reaches the same scheme, and is not the
 /// same command: it does not remember what to go back to, so putting the
 /// colour back lands on the default rather than on the scheme that was in use.
+/// Read or write the account positions are sized against.
+fn config_risk(store: &Store, m: &clap::ArgMatches, as_json: bool) -> Result<String, Fault> {
+    use omacharts_engine::position::Stake;
+    let mut risk = store.position_risk();
+    let account = number(m, "account")?;
+    if account.is_some_and(|a| !a.is_finite() || a <= 0.0) {
+        return Err(Fault::usage("--account is what the account is worth, more than zero".into()));
+    }
+    let stake = match arg(m, "risk") {
+        None => None,
+        Some(text) => Some(Stake::parse(text).ok_or_else(|| {
+            Fault::usage(format!("--risk is a percentage such as 1% or an amount such as 250, not {text:?}"))
+        })?),
+    };
+    let currency = arg(m, "currency").map(|c| c.trim().to_uppercase());
+    let changed = account.is_some() || stake.is_some() || currency.is_some();
+    if let Some(account) = account {
+        risk.account = account;
+    }
+    if let Some(stake) = stake {
+        risk.stake = stake;
+    }
+    if let Some(currency) = currency {
+        risk.currency = currency;
+    }
+    if changed {
+        store.set_position_risk(&risk);
+    }
+    let text = format!("{}{}", if changed { "set " } else { "" }, risk.describe());
+    said(
+        as_json,
+        json!({
+            "account": risk.account,
+            "risk": risk.stake.spell(),
+            "per_trade": risk.amount(),
+            "currency": risk.currency,
+            "message": text,
+        }),
+        text,
+    )
+}
+
 fn config_bars(
     store: &Store,
     m: &clap::ArgMatches,

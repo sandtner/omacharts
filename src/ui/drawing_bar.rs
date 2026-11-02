@@ -41,6 +41,7 @@ fn tool_group(kind: Option<Kind>) -> u8 {
         None => 0,
         Some(k) if k.is_line() => 1,
         Some(k) if k.is_text() => 3,
+        Some(k) if k.is_position() => 4,
         Some(_) => 2,
     }
 }
@@ -473,6 +474,24 @@ impl DrawingBar {
                         cr.set_source_rgba(r, g, b, a);
                         cr.set_line_width(1.0);
                         curve(cr);
+                        let _ = cr.stroke();
+                    }
+                    // Two zones stacked on an entry line: the target's
+                    // above, filled, and the stop's below, outlined — the
+                    // picture of a trade, in the button's one ink.
+                    Some(Kind::Position) => {
+                        let (x, rw) = (4.5, w - 9.0);
+                        let mid = (h / 2.0 + 1.0).round() + 0.5;
+                        cr.rectangle(x, 4.5, rw, mid - 4.5);
+                        cr.set_source_rgba(r, g, b, a * 0.30);
+                        let _ = cr.fill();
+                        cr.set_source_rgba(r, g, b, a);
+                        cr.set_line_width(1.0);
+                        cr.rectangle(x, mid, rw, h - 4.5 - mid);
+                        let _ = cr.stroke();
+                        cr.set_line_width(1.5);
+                        cr.move_to(x, mid);
+                        cr.line_to(x + rw, mid);
                         let _ = cr.stroke();
                     }
                     Some(Kind::Text) => {

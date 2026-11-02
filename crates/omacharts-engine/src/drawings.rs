@@ -404,13 +404,18 @@ pub enum Kind {
     /// Words on the chart, at the first anchor. The only kind whose size
     /// comes from what it says rather than from where its anchors are.
     Text,
+    /// A trade planned on the chart: `from` is the entry and the moment it
+    /// starts, `to` the target and the moment it is drawn out to, and
+    /// [`Drawing::stop`] the third price. Long when the target is above the
+    /// entry, short when below, and sized from the account's risk.
+    Position,
 }
 
 impl Kind {
     /// Every kind, in the order the tools are offered: the plain line
     /// first, then the two that are a line with one thing added, then the
     /// shapes, then the words.
-    pub const ALL: [Kind; 7] = [
+    pub const ALL: [Kind; 8] = [
         Kind::Line,
         Kind::Horizontal,
         Kind::Arrow,
@@ -418,6 +423,7 @@ impl Kind {
         Kind::Rect,
         Kind::Ellipse,
         Kind::Text,
+        Kind::Position,
     ];
 
     /// The kinds that are a shape, which is every kind that can carry text
@@ -444,6 +450,7 @@ impl Kind {
             Kind::Rect => "Rectangle",
             Kind::Ellipse => "Circle",
             Kind::Text => "Text",
+            Kind::Position => "Position",
         }
     }
 
@@ -456,6 +463,7 @@ impl Kind {
             Kind::Rect => "rect",
             Kind::Ellipse => "ellipse",
             Kind::Text => "text",
+            Kind::Position => "position",
         }
     }
 
@@ -473,6 +481,12 @@ impl Kind {
                     .any(|name| key.eq_ignore_ascii_case(name))
                     .then_some(Kind::Horizontal)
             })
+            .or_else(|| {
+                ["long", "short", "trade"]
+                    .iter()
+                    .any(|name| key.eq_ignore_ascii_case(name))
+                    .then_some(Kind::Position)
+            })
     }
 
     /// Whether this kind has an inside: a fill, and room for text in it.
@@ -484,6 +498,12 @@ impl Kind {
     /// carry some.
     pub fn is_text(self) -> bool {
         self == Kind::Text
+    }
+
+    /// Whether this is a planned trade, which paints and sizes itself
+    /// rather than following a look.
+    pub fn is_position(self) -> bool {
+        self == Kind::Position
     }
 }
 
@@ -1160,6 +1180,10 @@ impl Style {
             Kind::Rect => Style::rect(preset),
             Kind::Ellipse => Style::ellipse(preset),
             Kind::Text => Style::text(preset),
+            // Its zones are the theme's up and down, whatever the preset:
+            // a green stop would be a lie. The style only carries the words
+            // and how much of the fill shows.
+            Kind::Position => Style { border: false, ..Style::rect(preset) },
         }
     }
 
@@ -1204,6 +1228,8 @@ pub struct Configurations {
     pub horizontal: Vec<Style>,
     #[serde(default)]
     pub zigzag: Vec<Style>,
+    #[serde(default)]
+    pub position: Vec<Style>,
 }
 
 /// How many configurations each kind has.
@@ -1220,6 +1246,7 @@ impl Default for Configurations {
             rect: nine(Style::rect),
             ellipse: nine(Style::ellipse),
             text: nine(Style::text),
+            position: nine(|preset| Style::of(Kind::Position, preset)),
         }
     }
 }
@@ -1280,6 +1307,7 @@ impl Configurations {
             Kind::Rect => &self.rect,
             Kind::Ellipse => &self.ellipse,
             Kind::Text => &self.text,
+            Kind::Position => &self.position,
         }
     }
 
@@ -1292,6 +1320,7 @@ impl Configurations {
             Kind::Rect => &mut self.rect,
             Kind::Ellipse => &mut self.ellipse,
             Kind::Text => &mut self.text,
+            Kind::Position => &mut self.position,
         }
     }
 
@@ -1429,6 +1458,12 @@ pub struct Drawing {
     /// here beside the anchors rather than in [`Style`].
     #[serde(default, skip_serializing_if = "Text::is_empty")]
     pub text: Text,
+    /// A position's stop, the price the third of its zones is drawn to.
+    /// `None` until somebody puts it anywhere, and read meanwhile as the
+    /// mirror of the target — see [`Drawing::stop_price`]. Nothing on any
+    /// other kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<f64>,
 }
 
 /// Put drawings in the order they are painted: back to front, and the older
@@ -1456,7 +1491,25 @@ impl Drawing {
             scope: Scope::Shared,
             order: 0,
             text: Text::default(),
+            stop: None,
         }
+    }
+
+    /// The stop a position is drawn and sized to: the one set, or the target
+    /// mirrored through the entry.
+    pub fn stop_price(&self) -> f64 {
+        self.stop.unwrap_or_else(|| crate::position::mirrored_stop(self.from.price, self.to.price))
+    }
+
+    /// A position worked out against an account. `None` for every other kind.
+    pub fn plan(
+        &self,
+        risk: &crate::position::Risk,
+        kind: Option<crate::InstrumentKind>,
+    ) -> Option<crate::position::Plan> {
+        self.kind
+            .is_position()
+            .then(|| crate::position::Plan::new(self.from.price, self.stop_price(), self.to.price, risk, kind))
     }
 
     /// A zig-zag beginning at one point, with a second following the hand.
@@ -1595,7 +1648,7 @@ impl Drawing {
             // Half of one anchor each, so there is no whole anchor to hand
             // back; `move_grip` is the way to move them.
             Grip::Top | Grip::Bottom | Grip::Left | Grip::Right => None,
-            Grip::FromTo | Grip::ToFrom | Grip::Body => None,
+            Grip::FromTo | Grip::ToFrom | Grip::Body | Grip::Stop => None,
             Grip::Corner(n) => self.points.get_mut(n),
         }
     }
@@ -1612,6 +1665,12 @@ impl Drawing {
     /// left one is found first.
     pub fn drag_grip(&mut self, grip: Grip, at: Anchor) -> Grip {
         self.move_grip(grip, at);
+        // A position's grips are each one price or one moment, named for
+        // what they are rather than where they sit, so none turns into
+        // another when it crosses one.
+        if self.kind.is_position() {
+            return grip;
+        }
         let (earlier, later) = (self.from.ts.min(self.to.ts), self.from.ts.max(self.to.ts));
         let (lower, higher) = (self.from.price.min(self.to.price), self.from.price.max(self.to.price));
         match grip {
@@ -1654,6 +1713,28 @@ impl Drawing {
             self.settle();
             return;
         }
+        // A position's three prices are separate things to hold: the entry
+        // with its start, the target, the stop, and the far end in time. Set
+        // the stop on first contact, so moving the entry afterwards does not
+        // drag a stop nobody placed along with the mirror.
+        if self.kind.is_position() {
+            match grip {
+                Grip::From => {
+                    if self.stop.is_none() {
+                        self.stop = Some(self.stop_price());
+                    }
+                    self.from = at;
+                }
+                // Laying one down: the hand draws the target and how far
+                // in time, and the stop mirrors until it is put somewhere.
+                Grip::To => self.to = at,
+                Grip::FromTo => self.to.price = at.price,
+                Grip::Stop => self.stop = Some(at.price),
+                Grip::Right | Grip::ToFrom => self.to.ts = at.ts,
+                _ => {}
+            }
+            return;
+        }
         match grip {
             Grip::From => self.from = at,
             Grip::To => self.to = at,
@@ -1683,8 +1764,9 @@ impl Drawing {
                 };
                 anchor.ts = at.ts;
             }
-            // Answered above, before the kinds that have fixed ends.
-            Grip::Corner(_) | Grip::Body => {}
+            // Answered above, before the kinds that have fixed ends; the
+            // stop is a position's own.
+            Grip::Corner(_) | Grip::Body | Grip::Stop => {}
         }
     }
 
@@ -1697,6 +1779,9 @@ impl Drawing {
         for anchor in self.points.iter_mut() {
             anchor.ts += by_ts;
             anchor.price += by_price;
+        }
+        if let Some(stop) = self.stop.as_mut() {
+            *stop += by_price;
         }
     }
 
@@ -1732,6 +1817,9 @@ impl Drawing {
             // its properties, and a grip on its corner would promise a
             // stretch that is not on offer.
             Kind::Text => &[],
+            // The entry, the target and the stop, all at the start, and the
+            // far end on the entry line to draw it out in time.
+            Kind::Position => &[Grip::From, Grip::FromTo, Grip::Stop, Grip::Right],
             // Answered above, where the number of them is known.
             Kind::Zigzag => &[],
         }
@@ -1760,6 +1848,8 @@ pub enum Grip {
     Right,
     /// One corner of a zig-zag, by its place in the run.
     Corner(usize),
+    /// A position's stop, on its left edge.
+    Stop,
     /// The line itself, or the inside of the box: drag to move the whole
     /// thing.
     Body,
@@ -1792,11 +1882,19 @@ pub struct Projected {
     /// to select — which is the right answer for a word nobody has laid out
     /// yet, and a state that lasts exactly one frame.
     pub words: Option<(f64, f64, f64, f64)>,
+    /// A position's stop, as a height in pixels. `None` for every other
+    /// kind.
+    pub stop: Option<f64>,
 }
 
 impl Projected {
     pub fn new(kind: Kind, from: (f64, f64), to: (f64, f64)) -> Projected {
-        Projected { kind, from, to, corners: Vec::new(), words: None }
+        Projected { kind, from, to, corners: Vec::new(), words: None, stop: None }
+    }
+
+    /// The same projection, told where a position's stop is on screen.
+    pub fn with_stop(self, y: f64) -> Projected {
+        Projected { stop: Some(y), ..self }
     }
 
     /// A projection through a run of corners: the first and the last are
@@ -1805,7 +1903,7 @@ impl Projected {
     pub fn through(kind: Kind, corners: Vec<(f64, f64)>) -> Projected {
         let from = corners.first().copied().unwrap_or((0.0, 0.0));
         let to = corners.last().copied().unwrap_or(from);
-        Projected { kind, from, to, corners, words: None }
+        Projected { kind, from, to, corners, words: None, stop: None }
     }
 
     /// The same projection, told where its words landed.
@@ -1825,6 +1923,15 @@ impl Projected {
     pub fn grip(&self, grip: Grip) -> Option<(f64, f64)> {
         if let Grip::Corner(n) = grip {
             return self.corners.get(n).copied();
+        }
+        if self.kind.is_position() {
+            return match grip {
+                Grip::From => Some(self.from),
+                Grip::FromTo => Some((self.from.0, self.to.1)),
+                Grip::Stop => self.stop.map(|y| (self.from.0, y)),
+                Grip::Right => Some((self.to.0, self.from.1)),
+                _ => None,
+            };
         }
         match (self.kind, grip) {
             (Kind::Text, _) => None,
@@ -1856,6 +1963,7 @@ impl Projected {
         // `From` for the first point — and moving `from` moves nothing that
         // is drawn.
         let fixed: &[Grip] = match self.corners.is_empty() {
+            true if self.kind.is_position() => &[Grip::From, Grip::FromTo, Grip::Stop, Grip::Right],
             true => &[
                 Grip::From,
                 Grip::To,
@@ -1884,7 +1992,7 @@ impl Projected {
     /// taken as a hit on whatever is under it.
     pub fn near(&self, x: f64, y: f64, reach: f64) -> bool {
         let corners = (0..self.corners.len()).map(Grip::Corner);
-        let fixed = [Grip::From, Grip::To, Grip::FromTo, Grip::ToFrom];
+        let fixed = [Grip::From, Grip::To, Grip::FromTo, Grip::ToFrom, Grip::Stop, Grip::Right];
         let grips = fixed.into_iter().chain(corners).filter_map(|grip| self.grip(grip));
         let reach_grip = reach.max(GRIP_REACH);
         grips.into_iter().any(|at| distance(at, (x, y)) <= reach_grip) || self.on_body(x, y, reach)
@@ -1918,6 +2026,9 @@ impl Projected {
             // corners belong to whatever is under them, which is the whole
             // reason to reach for an ellipse over a box.
             Kind::Ellipse => inside_ellipse((x, y), self.bounds(), reach),
+            // Both zones, the stop's included: the whole of it is one thing
+            // to take hold of.
+            Kind::Position => within(self.bounds(), (x, y), reach),
             // A word is hit on the box its glyphs fill. The box is generous
             // by the same reach every other kind is, since a word is a
             // scatter of thin strokes and aiming between two of them is not
@@ -1949,7 +2060,7 @@ impl Projected {
             // The box the shape fills. A dragged selection is a rough
             // gesture over a region, not a click: catching an ellipse whose
             // bounding box the hand swept is what the hand meant.
-            Kind::Rect | Kind::Ellipse => overlaps(self.bounds()),
+            Kind::Rect | Kind::Ellipse | Kind::Position => overlaps(self.bounds()),
             Kind::Text => false,
         }
     }
@@ -1972,6 +2083,10 @@ impl Projected {
             right = right.max(*x);
             top = top.min(*y);
             bottom = bottom.max(*y);
+        }
+        if let Some(stop) = self.stop {
+            top = top.min(stop);
+            bottom = bottom.max(stop);
         }
         (left, top, right - left, bottom - top)
     }

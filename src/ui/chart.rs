@@ -256,6 +256,8 @@ struct State {
     /// The nine configurations of each kind, as the window has them: what a
     /// drawing that follows configuration N looks like.
     configs: Configurations,
+    /// The account a position drawing is sized against.
+    risk: omacharts_engine::position::Risk,
     /// What this chart shares its drawings with, which is also the scope a
     /// drawing made on it gets.
     /// Whether a drawing made here goes to the symbol or stays on this
@@ -1174,6 +1176,7 @@ impl State {
             ruler: None,
             next_config: 1,
             configs: Configurations::default(),
+            risk: omacharts_engine::position::Risk::default(),
             sends: true,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -1374,6 +1377,13 @@ impl State {
             true => Projected::through(drawing.kind, drawing.corners().iter().map(point).collect()),
             false => Projected::new(drawing.kind, point(&drawing.from), point(&drawing.to)),
         };
+        let projected = match drawing.kind.is_position() {
+            true => {
+                let stop = point(&Anchor::new(drawing.from.ts, drawing.stop_price())).1;
+                projected.with_stop(stop)
+            }
+            false => projected,
+        };
         // Measured here, for every caller, because the words are part of
         // the drawing and not only part of the picture of it: a label is
         // what the pointer takes hold of when it sits clear of the stroke,
@@ -1523,7 +1533,8 @@ impl State {
         let Some(drawing) = self.drawings.get(index) else { return "default" };
         let (from, to) = (drawing.from, drawing.to);
         match grip {
-            Grip::Top | Grip::Bottom => "ns-resize",
+            Grip::Top | Grip::Bottom | Grip::Stop => "ns-resize",
+            Grip::FromTo if drawing.kind.is_position() => "ns-resize",
             Grip::Left | Grip::Right => "ew-resize",
             Grip::Body => match held {
                 true => "grabbing",
@@ -2818,6 +2829,17 @@ impl ChartView {
 
     pub fn configurations(&self) -> Configurations {
         self.state.borrow().configs.clone()
+    }
+
+    /// The account positions on this chart are sized against.
+    pub fn set_position_risk(&self, risk: omacharts_engine::position::Risk) {
+        let mut state = self.state.borrow_mut();
+        if state.risk == risk {
+            return;
+        }
+        state.risk = risk;
+        drop(state);
+        self.redraw();
     }
 
     /// What this chart shares its drawings with.
@@ -6361,6 +6383,73 @@ fn draw_ruler(
     cr.restore().ok();
 }
 
+/// A planned trade: the target's zone in the candles' up colour, the stop's
+/// in their down, an entry line between them, and the arithmetic said on
+/// three tags — what it makes, what it loses, and how many to buy.
+fn draw_position(cr: &cairo::Context, state: &State, projected: &Projected, drawing: &Drawing, style: &omacharts_engine::Style) {
+    let kind = state.instrument.as_ref().map(|i| i.kind);
+    let Some(plan) = drawing.plan(&state.risk, kind) else { return };
+    let (left, right) = (projected.from.0.min(projected.to.0), projected.from.0.max(projected.to.0));
+    // At least a column wide, so a position laid down with one click is
+    // still something to see and take hold of.
+    let (left, right) = match right - left < 24.0 {
+        true => (left, left + 24.0),
+        false => (left, right),
+    };
+    let entry = projected.from.1;
+    let target = projected.to.1;
+    let stop = projected.stop.unwrap_or(entry);
+    let alpha = match style.alpha > 0.0 {
+        true => (style.alpha * 1.4).min(0.6),
+        false => 0.22,
+    };
+    let (up, down) = (&state.scheme.up, &state.scheme.down);
+    let zone = |cr: &cairo::Context, colour: &str, a: f64, b: f64| {
+        let (top, bottom) = (a.min(b), a.max(b));
+        colors::set_source_alpha(cr, colour, alpha);
+        cr.rectangle(left, top, right - left, bottom - top);
+        let _ = cr.fill();
+    };
+    zone(cr, up, entry, target);
+    zone(cr, down, entry, stop);
+    colors::set_source(cr, &state.scheme.neutral);
+    cr.set_line_width(1.0);
+    cr.move_to(left, entry.round() + 0.5);
+    cr.line_to(right, entry.round() + 0.5);
+    let _ = cr.stroke();
+
+    let labels = plan.labels(&state.risk, kind);
+    cr.select_font_face("sans-serif", cairo::FontSlant::Normal, cairo::FontWeight::Normal);
+    cr.set_font_size(11.0);
+    let centre = (left + right) / 2.0;
+    // A tag on the far side of an edge from the entry, so it never sits in
+    // the zone it is about — the zone is the picture, the tag the numbers.
+    let tag = |cr: &cairo::Context, text: &str, edge: f64, away: f64, fill: &Tag| {
+        let w = cr.text_extents(text).map(|e| e.x_advance()).unwrap_or(0.0) + 12.0;
+        let h = 18.0;
+        let y = match away {
+            d if d < 0.0 => edge - h - 3.0,
+            d if d > 0.0 => edge + 3.0,
+            _ => edge - h / 2.0,
+        };
+        // Kept inside the plot, which the caller has clipped to: a tag
+        // pushed off the bottom is a number nobody can read.
+        let (clip_x0, clip_y0, clip_x1, clip_y1) = cr.clip_extents().unwrap_or((0.0, 0.0, f64::MAX, f64::MAX));
+        let y = y.clamp(clip_y0 + 2.0, (clip_y1 - h - 2.0).max(clip_y0 + 2.0));
+        let x = (centre - w / 2.0).clamp(clip_x0 + 2.0, (clip_x1 - w - 2.0).max(clip_x0 + 2.0)).round();
+        colors::set_source(cr, &fill.fill);
+        cr.rectangle(x, y.round(), w.round(), h);
+        let _ = cr.fill();
+        colors::set_source(cr, &fill.label);
+        cr.move_to(x + 6.0, y.round() + 13.0);
+        let _ = cr.show_text(text);
+    };
+    let neutral = Tag::on(&state.scheme.neutral);
+    tag(cr, &labels.target, target, target - entry, &state.price_tags[0]);
+    tag(cr, &labels.stop, stop, stop - entry, &state.price_tags[1]);
+    tag(cr, &labels.entry, entry, 0.0, &neutral);
+}
+
 fn now_list(list: &[Drawing], at: usize) -> Option<&Drawing> {
     list.get(at)
 }
@@ -6541,6 +6630,7 @@ fn draw_drawing(
         // kind. A text drawing with nothing typed into it yet draws nothing
         // at all, which is the right picture of a caret waiting.
         DrawingKind::Text => {}
+        DrawingKind::Position => draw_position(cr, state, projected, drawing, style),
     }
     if !typing {
         draw_label(cr, state, projected, drawing, style);
@@ -7390,6 +7480,7 @@ impl Clock {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     /// The bug: a chart that could not fetch told the user the symbol had no

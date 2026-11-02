@@ -1154,6 +1154,15 @@ impl Store {
         }
     }
 
+    /// The account and the risk a position drawing is sized against.
+    pub fn position_risk(&self) -> omacharts_engine::position::Risk {
+        omacharts_engine::position::Risk::from_json(self.setting(omacharts_engine::position::SETTING).as_deref())
+    }
+
+    pub fn set_position_risk(&self, risk: &omacharts_engine::position::Risk) {
+        self.set_setting(omacharts_engine::position::SETTING, &risk.to_json());
+    }
+
     // -- saved themes ------------------------------------------------------
 
     pub fn custom_themes(&self) -> Vec<Theme> {

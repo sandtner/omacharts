@@ -5969,6 +5969,7 @@ impl Window {
         pane.view.set_trouble(None);
         pane.view.set_loading(cached_was_empty);
         pane.view.set_configurations(self.store.drawing_configurations());
+        pane.view.set_position_risk(self.store.position_risk());
         let shared = self.store.drawings(&instrument.symbol, instrument.suffix.as_deref());
         pane.view.set_drawings(self.drawings_for(pane, &shared));
 
@@ -8109,6 +8110,14 @@ impl Window {
         self.store.drawing_configurations()
     }
 
+    /// Write the account positions are sized against, and show every chart.
+    pub fn set_position_risk(&self, store: &Store, risk: omacharts_engine::position::Risk) {
+        store.set_position_risk(&risk);
+        for pane in self.panes.borrow().iter() {
+            pane.view.set_position_risk(risk.clone());
+        }
+    }
+
     /// Write the configurations down and show every chart the new ones, so
     /// a drawing that follows configuration N changes with it, on every
     /// chart, as it is edited.
@@ -9050,6 +9059,13 @@ impl Window {
             this.arm_drawing(omacharts_engine::DrawingKind::Text)
         });
         actions.add_action(&draw_text);
+
+        let draw_position = gio::SimpleAction::new("draw-position", None);
+        let this = self.clone();
+        draw_position.connect_activate(move |_, _| {
+            this.arm_drawing(omacharts_engine::DrawingKind::Position)
+        });
+        actions.add_action(&draw_position);
 
         let measure = gio::SimpleAction::new("measure", None);
         let this = self.clone();

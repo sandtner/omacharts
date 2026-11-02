@@ -820,6 +820,32 @@ it as it was; Ctrl+B and Ctrl+I set the selection — or the word the caret is
 in — bold or italic. Ctrl+= and Ctrl+− grow and shrink the selected
 drawing's text, which on a figure is its label rather than the figure.
 
+## Planning a position
+
+A position is a drawing of a trade: the entry, the target, and the stop, with
+the size worked out from the account. `--from` is the entry and when it
+starts, `--to` the target and how far out it is drawn, and `--stop` the stop.
+A target above the entry is a long and one below is a short. Without `--stop`
+the stop mirrors the target through the entry, so it starts at 1:1.
+
+```sh
+omacharts config risk --account 50000 --risk 1% --currency CHF
+# set account 50,000 CHF, risking 1% (500 CHF) a trade
+omacharts chart drawing add position --from 2026-10-01,182 --to 2026-10-20,195 --stop 179
+# drew #1 position  2026-10-01 182.00 → 2026-10-20 195.00  configuration 1 · shared
+#     Long 166 @ 182.00  R:R 4.33; Target 195.00  +7.14%  +2,158 CHF; Stop 179.00  -1.65%  −498 CHF …
+omacharts chart drawing set --id 1 --stop 180
+omacharts chart drawing list --json     # each position carries its "plan"
+```
+
+`--risk` is a percentage of the account (`1%`) or a fixed amount (`250`). The
+account is one setting for every position on every chart; `config risk` with
+no flags reads it. Shares are sized in whole units, crypto and currencies in
+fractions. In the window, Alt+P or the position tool draws one: click the
+entry, then the target. Drag the grip on the stop to move it, and drag the
+grip on the right end to change how far out the position runs. Its
+properties dialog edits the three prices and the account.
+
 ## Measuring a move
 
 With a window open, `chart measure` puts the ruler on the focused chart between
