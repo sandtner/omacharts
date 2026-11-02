@@ -1086,6 +1086,28 @@ impl Store {
         drawings
     }
 
+    /// One shared drawing by its id, with the symbol it is drawn on.
+    pub fn drawing_by_id(&self, id: i64) -> Option<(String, Option<String>, Drawing)> {
+        let (symbol, suffix, json): (String, String, String) = self
+            .conn
+            .query_row("SELECT symbol, suffix, json FROM drawings WHERE id = ?1", params![id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .ok()?;
+        let mut drawing: Drawing = serde_json::from_str(&json).ok()?;
+        drawing.id = id;
+        Some((symbol, Some(suffix).filter(|s| !s.is_empty()), drawing))
+    }
+
+    /// Every price alert, armed and fired.
+    pub fn alerts(&self) -> Vec<omacharts_engine::alert::Alert> {
+        omacharts_engine::alert::from_json(self.setting(omacharts_engine::alert::SETTING).as_deref())
+    }
+
+    pub fn set_alerts(&self, alerts: &[omacharts_engine::alert::Alert]) {
+        self.set_setting(omacharts_engine::alert::SETTING, &omacharts_engine::alert::to_json(alerts));
+    }
+
     /// Write a drawing down for the first time. Hands back its id, which the
     /// caller keeps on the drawing so later writes find the same row.
     pub fn add_drawing(&self, symbol: &str, suffix: Option<&str>, drawing: &Drawing) -> Option<i64> {

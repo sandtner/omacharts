@@ -5,6 +5,7 @@
 //! split keeps the parts that deserve tests testable without a display, and
 //! keeps the provider boundary honest.
 
+pub mod alert;
 pub mod bars;
 pub mod clock;
 pub mod drawings;

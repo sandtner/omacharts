@@ -1831,6 +1831,12 @@ type SeriesCache = Rc<RefCell<HashMap<(String, Timeframe), Rc<Vec<omacharts_engi
 /// because it cannot exist until the rows it refers to do.
 type Rebuild = Rc<RefCell<Option<Box<dyn Fn()>>>>;
 
+
+/// How old a reply's newest bar may be and still count as the price now,
+/// for an alert. A day and a half covers a daily bar stamped at the session's
+/// open; anything older is history being paged in.
+const ALERT_FRESH_SECONDS: i64 = 36 * 3600;
+
 pub struct Window {
     pub window: adw::ApplicationWindow,
     /// Every chart on screen. One of them is focused, and that is the one the
@@ -5384,6 +5390,9 @@ impl Window {
                             rail.refresh_quotes();
                             this.write_changes();
                         }
+                        if !keys.is_empty() {
+                            this.check_alert_quotes(&keys);
+                        }
                         // Any failure, not only a refusal: a batch that came
                         // back with nothing leaves every row in it due, and
                         // the next tick would send it again a minute later.
@@ -5392,6 +5401,13 @@ impl Window {
                         }
                     }
                     Response::Bars { key, timeframe, bars } => {
+                        // The newest bar is a price, if it is today's rather
+                        // than a page of history fetched further back.
+                        if let Some(newest) = bars.iter().max_by_key(|b| b.ts)
+                            && newest.ts >= chrono::Utc::now().timestamp() - ALERT_FRESH_SECONDS
+                        {
+                            this.check_alert_price(&key, newest.close);
+                        }
                         this.present(&key, timeframe, bars, None);
                         // One at a time, each asked for as the last lands.
                         this.loader().keep_warming(&key, timeframe, |tf| {
@@ -5972,6 +5988,11 @@ impl Window {
         pane.view.set_position_risk(self.store.position_risk());
         let shared = self.store.drawings(&instrument.symbol, instrument.suffix.as_deref());
         pane.view.set_drawings(self.drawings_for(pane, &shared));
+        pane.view.set_alert_levels(crate::alerts::levels(
+            &self.store,
+            &instrument.symbol,
+            instrument.suffix.as_deref(),
+        ));
 
         // Only the focused chart drives the rail and the prefetch window: the
         // others are not where the next keystroke is going.
@@ -6776,8 +6797,21 @@ impl Window {
         self.drain_scheduled.set(false);
         let Some(live) = self.live() else { return };
         let drained = live.drain();
+        let mut ticked: Vec<crate::live::Series> = Vec::new();
+        for change in &drained.changes {
+            if let Change::Snapshot(series) | Change::Tail { series, .. } = change
+                && !ticked.contains(series)
+            {
+                ticked.push(series.clone());
+            }
+        }
         for change in drained.changes {
             self.apply_live_change(change);
+        }
+        for series in ticked {
+            if let Some(price) = live.with_bars(&series, |bars| bars.last().map(|b| b.close)).flatten() {
+                self.check_alert_price(&series.key, price);
+            }
         }
         if drained.schedule_flush {
             let registry = live.clone();
@@ -8088,8 +8122,79 @@ impl Window {
                 .unwrap_or(false);
             if same {
                 pane.view.set_drawings(self.drawings_for(pane, &shared));
+                pane.view.set_alert_levels(crate::alerts::levels(&self.store, symbol, suffix));
             }
         }
+    }
+
+    /// Check the alerts against quotes a batch just wrote.
+    fn check_alert_quotes(self: &Rc<Self>, keys: &[String]) {
+        let Some(index) = self.symbols() else { return };
+        let fired = crate::alerts::check_quotes(&self.store, self.provider().as_ref(), &index, Some(keys));
+        self.after_alerts(&fired);
+    }
+
+    /// Check the alerts on one series against a price just seen on it.
+    fn check_alert_price(self: &Rc<Self>, key: &str, price: f64) {
+        let Some(index) = self.symbols() else { return };
+        let fired = crate::alerts::check_price(&self.store, self.provider().as_ref(), &index, key, price);
+        self.after_alerts(&fired);
+    }
+
+    /// A fired alert leaves the chart: what is drawn is what is still armed.
+    fn after_alerts(self: &Rc<Self>, fired: &[omacharts_engine::alert::Fired]) {
+        if fired.is_empty() {
+            return;
+        }
+        self.refresh_alert_levels();
+    }
+
+    /// Show every chart the armed alerts on its symbol.
+    pub fn refresh_alert_levels(&self) {
+        for pane in self.panes.borrow().iter() {
+            let instrument = pane.instrument.borrow().clone();
+            if let Some(instrument) = instrument {
+                pane.view.set_alert_levels(crate::alerts::levels(
+                    &self.store,
+                    &instrument.symbol,
+                    instrument.suffix.as_deref(),
+                ));
+            }
+        }
+    }
+
+    /// Put an alert on the selected horizontal line, or take it off.
+    fn toggle_line_alert(self: &Rc<Self>) {
+        use omacharts_engine::alert::{next_id, Alert, Condition};
+        let pane = self.focused_pane();
+        let Some(line) = pane.view.selected_drawing() else { return };
+        let instrument = pane.instrument.borrow().clone();
+        let Some(instrument) = instrument else { return };
+        if line.kind != omacharts_engine::DrawingKind::Horizontal || line.id <= 0 {
+            return;
+        }
+        let mut alerts = self.store.alerts();
+        match alerts.iter().position(|a| a.drawing == Some(line.id)) {
+            Some(at) => {
+                alerts.remove(at);
+            }
+            None => {
+                let now = chrono::Utc::now().timestamp();
+                let mut alert = Alert::new(
+                    &instrument.symbol,
+                    instrument.suffix.as_deref(),
+                    Condition::Cross,
+                    line.from.price,
+                    now,
+                );
+                alert.id = next_id(&alerts);
+                alert.drawing = Some(line.id);
+                alert.last = crate::cli::quote(&self.store, self.provider().as_ref(), &instrument).map(|q| q.last);
+                alerts.push(alert);
+            }
+        }
+        self.store.set_alerts(&alerts);
+        self.refresh_alert_levels();
     }
 
     /// What one chart sees, out of what is drawn on its symbol.
@@ -8359,6 +8464,16 @@ impl Window {
             false => "Add text",
         };
         shortcuts::append_with_key(&edit, words, "chart.drawing-text", "Return");
+        // A shared level can carry an alert; a chart's own cannot, since an
+        // alert is about the symbol, not one chart of it.
+        if drawing.kind == omacharts_engine::DrawingKind::Horizontal && drawing.id > 0 {
+            let has = self.store.alerts().iter().any(|a| a.drawing == Some(drawing.id) && a.is_armed());
+            let label = match has {
+                true => "Remove alert",
+                false => "Alert when crossed",
+            };
+            edit.append(Some(label), Some("chart.drawing-alert"));
+        }
         menu.append_section(None, &edit);
         menu.append_section(None, &self.clipboard_section("chart.drawing-delete"));
 
@@ -9066,6 +9181,11 @@ impl Window {
             this.arm_drawing(omacharts_engine::DrawingKind::Position)
         });
         actions.add_action(&draw_position);
+
+        let drawing_alert = gio::SimpleAction::new("drawing-alert", None);
+        let this = self.clone();
+        drawing_alert.connect_activate(move |_, _| this.toggle_line_alert());
+        actions.add_action(&drawing_alert);
 
         let measure = gio::SimpleAction::new("measure", None);
         let this = self.clone();

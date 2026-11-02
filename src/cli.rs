@@ -255,6 +255,8 @@ pub trait Live {
     /// Show the header the settings now name on every chart on screen.
     /// Nothing to do without a window.
     fn adopt_header(&self) {}
+    /// The alerts changed: show the charts the levels still armed.
+    fn adopt_alerts(&self) {}
     /// Draw every chart on screen in the time zone and the time format the
     /// settings now name. Nothing to do without a window.
     fn adopt_clock(&self) {}
@@ -755,6 +757,30 @@ fn refresh(store: &Store, provider: &dyn Provider, plan: Refresh) {
     }
 }
 
+/// Fetch what is due for the alerts' symbols and check them.
+///
+/// With no window, here and now, and the answer is what fired. In the window
+/// the fetch is queued like the widget's, and the replies check the alerts as
+/// they land — so there is nothing to report yet, and this says so.
+pub fn check_alerts(store: &Store, live: Option<&dyn Live>) -> Vec<omacharts_engine::alert::Fired> {
+    let index = resolver(live);
+    let provider = crate::feeds::selected(store);
+    let instruments = crate::alerts::instruments(store, &index);
+    let now = chrono::Utc::now().timestamp();
+    let plan = plan_refresh(store, provider.as_ref(), &instruments, now, MAX_BATCHES);
+    match live {
+        Some(live) => {
+            live.warm(&plan.bars);
+            live.warm_closes(plan.closes);
+            Vec::new()
+        }
+        None => {
+            refresh(store, provider.as_ref(), plan);
+            crate::alerts::check_quotes(store, provider.as_ref(), &index, None)
+        }
+    }
+}
+
 /// The watchlist as JSON, for the bar widget.
 pub fn watchlist_json(store: &Store, refresh_first: bool, live: Option<&dyn Live>) -> String {
     let index = resolver(live);
@@ -762,11 +788,15 @@ pub fn watchlist_json(store: &Store, refresh_first: bool, live: Option<&dyn Live
 
     let sections = store.watchlist();
     if refresh_first {
-        let instruments: Vec<Instrument> = sections
+        // The symbols alerts are set on ride along: the poll is what checks
+        // them, and an alert on something no watchlist holds would otherwise
+        // never see a price. `plan_refresh` asks once for a symbol on both.
+        let mut instruments: Vec<Instrument> = sections
             .iter()
             .flat_map(|section| section.entries.iter())
             .filter_map(|entry| index.find(&entry.symbol, entry.suffix.as_deref()).cloned())
             .collect();
+        instruments.extend(crate::alerts::instruments(store, &index));
         let now = chrono::Utc::now().timestamp();
         let plan = plan_refresh(store, provider.as_ref(), &instruments, now, MAX_BATCHES);
         match live {
@@ -778,8 +808,13 @@ pub fn watchlist_json(store: &Store, refresh_first: bool, live: Option<&dyn Live
                 live.warm(&plan.bars);
                 live.warm_closes(plan.closes);
             }
-            // A process of its own, with no window and nothing to block.
-            None => refresh(store, provider.as_ref(), plan),
+            // A process of its own, with no window and nothing to block —
+            // and nobody else to check the alerts once the prices are in.
+            // In the window the replies do that as they land.
+            None => {
+                refresh(store, provider.as_ref(), plan);
+                crate::alerts::check_quotes(store, provider.as_ref(), &index, None);
+            }
         }
     }
 
@@ -980,6 +1015,10 @@ impl Live for Rc<crate::ui::Window> {
 
     fn adopt_feed(&self) {
         crate::ui::Window::adopt_feed(self);
+    }
+
+    fn adopt_alerts(&self) {
+        self.refresh_alert_levels();
     }
 
     fn adopt_header(&self) {

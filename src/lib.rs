@@ -3,6 +3,7 @@
 //! The app half. Storage, drawing and the GTK window live here; everything
 //! worth testing without a display lives in `omacharts-engine`.
 
+pub mod alerts;
 pub mod backup;
 pub mod book_templates;
 pub mod bar_plugin;

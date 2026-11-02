@@ -846,6 +846,40 @@ entry, then the target. Drag the grip on the stop to move it, and drag the
 grip on the right end to change how far out the position runs. Its
 properties dialog edits the three prices and the account.
 
+## Price alerts
+
+An alert is a level on a symbol and a desktop notification when the price
+reaches it. `--above` and `--below` fire once the price is on that side.
+`--cross` fires when the price goes through the level in either direction.
+`--drawing` follows a shared horizontal line and fires when the price
+crosses it, even if the line has been moved since. With no symbol, the alert
+goes on the focused chart's symbol.
+
+```sh
+omacharts alert add AAPL --above 250 --note breakout
+omacharts alert add --drawing 12          # the level line #12, wherever it is moved
+omacharts alert list
+omacharts alert rearm 1                   # a fired alert, ready again
+omacharts alert remove 1
+omacharts alert clear --fired
+omacharts alert check                     # fetch what is due and check now
+```
+
+Alerts are checked wherever a fresh price turns up, and the app does not
+poll for them:
+
+- the bar widget's poll, every two minutes by default, with or without a
+  window, which fetches the alerts' symbols along with the watchlist;
+- in the window, each batch of quotes and each chart reply as it lands;
+- a chart that is streaming, on the tick that crosses the level.
+
+So with the window closed, an alert depends on the bar widget being
+installed (`omacharts plugin install`). Without the widget, run
+`omacharts alert check` from a timer of your own. An alert fires once, and
+`alert rearm` makes it ready again. Armed alerts are drawn on their charts as
+dotted amber lines. A shared horizontal line's menu has "Alert when crossed",
+which also offers to take the alert off again.
+
 ## Measuring a move
 
 With a window open, `chart measure` puts the ruler on the focused chart between
@@ -1392,6 +1426,7 @@ story, and adding a manifest would be a second thing to maintain for nothing.
 | `chartbook` | saved arrangements of charts |
 | `chart` | the charts inside a chartbook |
 | `template` | chart templates: named sets of indicators that charts share |
+| `alert` | price alerts, as desktop notifications |
 | `provider` | the data feed, and signing in to one that needs it |
 | `config` | stored preferences |
 | `cache` | the cached market data |

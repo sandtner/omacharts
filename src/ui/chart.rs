@@ -258,6 +258,8 @@ struct State {
     configs: Configurations,
     /// The account a position drawing is sized against.
     risk: omacharts_engine::position::Risk,
+    /// The prices of the armed alerts on this chart's symbol.
+    alert_levels: Vec<f64>,
     /// What this chart shares its drawings with, which is also the scope a
     /// drawing made on it gets.
     /// Whether a drawing made here goes to the symbol or stays on this
@@ -1177,6 +1179,7 @@ impl State {
             next_config: 1,
             configs: Configurations::default(),
             risk: omacharts_engine::position::Risk::default(),
+            alert_levels: Vec::new(),
             sends: true,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -2829,6 +2832,17 @@ impl ChartView {
 
     pub fn configurations(&self) -> Configurations {
         self.state.borrow().configs.clone()
+    }
+
+    /// The levels of the armed alerts on this chart's symbol.
+    pub fn set_alert_levels(&self, levels: Vec<f64>) {
+        let mut state = self.state.borrow_mut();
+        if state.alert_levels == levels {
+            return;
+        }
+        state.alert_levels = levels;
+        drop(state);
+        self.redraw();
     }
 
     /// The account positions on this chart are sized against.
@@ -4916,6 +4930,7 @@ fn draw(cr: &cairo::Context, width: f64, height: f64, state: &State) {
     draw_indicator_lines(cr, state, &columns, &to_y);
     cr.restore().ok();
     draw_drawings(cr, state, &plan, &scale);
+    draw_alert_levels(cr, state, &plan, &scale);
 
     for (at, row) in plan.rows.iter().enumerate() {
         draw_row_edge(cr, state, &plan, at);
@@ -6448,6 +6463,46 @@ fn draw_position(cr: &cairo::Context, state: &State, projected: &Projected, draw
     tag(cr, &labels.target, target, target - entry, &state.price_tags[0]);
     tag(cr, &labels.stop, stop, stop - entry, &state.price_tags[1]);
     tag(cr, &labels.entry, entry, 0.0, &neutral);
+}
+
+/// Each armed alert as a dotted line across the plot and a tag at its left
+/// end, in amber: the colour every theme keeps for "mind this", and none of
+/// the candles' own.
+fn draw_alert_levels(cr: &cairo::Context, state: &State, plan: &Layout, scale: &PriceScale) {
+    if state.alert_levels.is_empty() {
+        return;
+    }
+    let amber = omacharts_engine::Paint::preset(omacharts_engine::Preset::Amber).hex(&state.theme);
+    let kind = state.instrument.as_ref().map(|i| i.kind);
+    cr.save().ok();
+    cr.rectangle(plan.plot_x, plan.price_y, plan.plot_w, plan.price_h);
+    cr.clip();
+    cr.select_font_face("sans-serif", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
+    cr.set_font_size(10.0);
+    for level in &state.alert_levels {
+        let y = scale.to_y(*level, plan.price_y, plan.price_h).round() + 0.5;
+        if !(plan.price_y..=plan.price_y + plan.price_h).contains(&y) {
+            continue;
+        }
+        colors::set_source_alpha(cr, &amber, 0.85);
+        cr.set_line_width(1.0);
+        cr.set_dash(&[2.0, 3.0], 0.0);
+        cr.move_to(plan.plot_x, y);
+        cr.line_to(plan.plot_x + plan.plot_w, y);
+        let _ = cr.stroke();
+        cr.set_dash(&[], 0.0);
+        let decimals = omacharts_engine::price_decimals(0.0, *level, kind);
+        let text = format!("ALERT {}", omacharts_engine::grouped_decimals(*level, decimals));
+        let w = cr.text_extents(&text).map(|e| e.x_advance()).unwrap_or(0.0) + 10.0;
+        let (x, h) = (plan.plot_x + 4.0, 15.0);
+        colors::set_source(cr, &amber);
+        cr.rectangle(x, y - h / 2.0, w.round(), h);
+        let _ = cr.fill();
+        colors::set_source(cr, &state.theme.ui.background);
+        cr.move_to(x + 5.0, y + 3.5);
+        let _ = cr.show_text(&text);
+    }
+    cr.restore().ok();
 }
 
 fn now_list(list: &[Drawing], at: usize) -> Option<&Drawing> {

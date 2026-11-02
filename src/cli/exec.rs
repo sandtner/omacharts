@@ -169,6 +169,27 @@ pub fn dispatch(
             outcome
         }
 
+        ("alert", "list") => alert_list(store, m, json),
+        ("alert", _) => {
+            let outcome = match verb {
+                "add" => alert_add(store, m, json, live.is_some()),
+                "remove" => alert_remove(store, m, json),
+                "rearm" => alert_rearm(store, m, json),
+                "clear" => alert_clear(store, m, json),
+                "check" => alert_check(store, json, live),
+                _ => Err(Fault::usage(format!("no such command: alert {verb}"))),
+            };
+            // The levels on the charts, and nothing else: an alert is not
+            // the arrangement, and rebuilding it for one would be the
+            // stutter the rule about refreshing what changed is there for.
+            if outcome.is_ok()
+                && let Some(live) = live
+            {
+                live.adopt_alerts();
+            }
+            outcome
+        }
+
         ("provider", "list") => provider_list(store, json),
         ("provider", "status") => provider_status(store, live, json),
         ("provider", "login") => provider_login(store, m, json),
@@ -4465,6 +4486,218 @@ const COLOURED_BARS: &str = "coloured_bar_scheme";
 /// `config set bar_scheme theme-mono` reaches the same scheme, and is not the
 /// same command: it does not remember what to go back to, so putting the
 /// colour back lands on the default rather than on the scheme that was in use.
+/// `AAPL` or `NESN.SW` into a symbol and a suffix, through the catalogue so
+/// that a ticker with a dot in it is not split.
+fn alert_symbol(text: &str) -> Result<(String, Option<String>), Fault> {
+    let index = crate::inventory::everything();
+    let upper = text.trim().to_uppercase();
+    if let Some(found) = index.find(&upper, None) {
+        return Ok((found.symbol.clone(), found.suffix.clone()));
+    }
+    if let Some((symbol, suffix)) = upper.rsplit_once('.')
+        && let Some(found) = index.find(symbol, Some(suffix))
+    {
+        return Ok((found.symbol.clone(), found.suffix.clone()));
+    }
+    Err(Fault::not_found(format!("{text:?} is not an instrument this app knows; try `symbol search`")))
+}
+
+/// How many decimals a level on a symbol is written to.
+fn alert_decimals(alert: &omacharts_engine::alert::Alert) -> usize {
+    let kind = crate::inventory::everything().find(&alert.symbol, alert.suffix.as_deref()).map(|i| i.kind);
+    omacharts_engine::price_decimals(0.0, alert.level, kind)
+}
+
+fn alert_json(alert: &omacharts_engine::alert::Alert) -> Value {
+    let mut value = serde_json::to_value(alert).unwrap_or_else(|_| json!({}));
+    value["armed"] = json!(alert.is_armed());
+    value["display"] = json!(alert.spell_symbol());
+    value
+}
+
+fn alert_list(store: &Store, m: &clap::ArgMatches, as_json: bool) -> Result<String, Fault> {
+    let only = arg(m, "SYMBOL").map(|s| alert_symbol(s)).transpose()?;
+    let alerts: Vec<_> = store
+        .alerts()
+        .into_iter()
+        .filter(|a| only.as_ref().is_none_or(|(symbol, suffix)| a.is_for(symbol, suffix.as_deref())))
+        .collect();
+    if as_json {
+        return Ok(format!("{}\n", json!({"alerts": alerts.iter().map(alert_json).collect::<Vec<_>>()})));
+    }
+    if alerts.is_empty() {
+        return Ok("no alerts\n".into());
+    }
+    Ok(alerts.iter().map(|a| a.describe(alert_decimals(a))).collect::<Vec<_>>().join("\n") + "\n")
+}
+
+fn alert_add(store: &Store, m: &clap::ArgMatches, as_json: bool, window: bool) -> Result<String, Fault> {
+    use omacharts_engine::alert::{next_id, Alert, Condition};
+    let price = |id: &str| -> Result<Option<f64>, Fault> {
+        let value = number(m, id)?;
+        if value.is_some_and(|v| !v.is_finite() || v <= 0.0) {
+            return Err(Fault::usage(format!("--{id} is a price, more than zero")));
+        }
+        Ok(value)
+    };
+    let drawing = match arg(m, "drawing") {
+        None => None,
+        Some(text) => Some(
+            text.parse::<i64>()
+                .map_err(|_| Fault::usage(format!("--drawing takes an id from `chart drawing list`, not {text:?}")))?,
+        ),
+    };
+    let given: Vec<(Condition, f64)> = [
+        (Condition::Above, price("above")?),
+        (Condition::Below, price("below")?),
+        (Condition::Cross, price("cross")?),
+    ]
+    .into_iter()
+    .filter_map(|(c, p)| p.map(|p| (c, p)))
+    .collect();
+    if given.len() + usize::from(drawing.is_some()) != 1 {
+        return Err(Fault::usage("give one of --above, --below, --cross or --drawing".into()));
+    }
+
+    // The symbol: named, the line's, or the focused chart's.
+    let (symbol, suffix, condition, level) = match (drawing, given.first()) {
+        (Some(id), _) => {
+            if id < 0 {
+                return Err(Fault::refused(
+                    "that line is the chart's own; an alert follows a line every chart of the symbol shares".into(),
+                ));
+            }
+            let Some((symbol, suffix, line)) = store.drawing_by_id(id) else {
+                return Err(Fault::not_found(format!("no shared drawing {id}")));
+            };
+            if line.kind != omacharts_engine::DrawingKind::Horizontal {
+                return Err(Fault::refused(format!(
+                    "#{id} is a {}; an alert follows a horizontal line",
+                    line.kind.key()
+                )));
+            }
+            (symbol, suffix, Condition::Cross, line.from.price)
+        }
+        (None, Some((condition, level))) => {
+            let (symbol, suffix) = match arg(m, "SYMBOL") {
+                Some(text) => alert_symbol(text)?,
+                None => {
+                    if !window {
+                        return Err(Fault::no_window("focused chart"));
+                    }
+                    let workspace = Workspace::load(store);
+                    let at = workspace.resolve(None)?;
+                    let book = workspace.book(at)?.clone();
+                    let pane = charts::resolve_pane(&book, None)?;
+                    let chart = charts::panes(&book)
+                        .iter()
+                        .find(|p| p["id"].as_u64() == Some(pane as u64))
+                        .cloned()
+                        .unwrap_or_default();
+                    let symbol = chart["symbol"].as_str().unwrap_or("").to_string();
+                    if symbol.is_empty() {
+                        return Err(Fault::refused("the focused chart has no symbol".into()));
+                    }
+                    let suffix = chart["suffix"].as_str().filter(|s| !s.is_empty()).map(str::to_string);
+                    (symbol, suffix)
+                }
+            };
+            (symbol, suffix, *condition, *level)
+        }
+        (None, None) => unreachable!("one of them was counted above"),
+    };
+    if let Some(text) = arg(m, "SYMBOL")
+        && drawing.is_some()
+    {
+        let (named, named_suffix) = alert_symbol(text)?;
+        if named != symbol || named_suffix != suffix {
+            return Err(Fault::usage(format!("line #{} is on {symbol}, not {text}", drawing.unwrap_or_default())));
+        }
+    }
+
+    let mut alerts = store.alerts();
+    let mut alert = Alert::new(&symbol, suffix.as_deref(), condition, level, chrono::Utc::now().timestamp());
+    alert.id = next_id(&alerts);
+    alert.drawing = drawing;
+    alert.note = arg(m, "note").cloned().unwrap_or_default();
+    // A crossing is measured from the price as it is now, so it is
+    // remembered at once when there is one; without it the first check
+    // only learns where the price is.
+    let index = crate::inventory::everything();
+    let provider = crate::feeds::selected(store);
+    if let Some(instrument) = index.find(&symbol, suffix.as_deref()) {
+        alert.last = super::quote(store, provider.as_ref(), instrument).map(|q| q.last);
+    }
+    let decimals = alert_decimals(&alert);
+    let text = format!("set {}", alert.describe(decimals));
+    let value = alert_json(&alert);
+    alerts.push(alert);
+    store.set_alerts(&alerts);
+    said(as_json, json!({"alert": value, "message": text}), text)
+}
+
+fn alert_id(m: &clap::ArgMatches) -> Result<i64, Fault> {
+    let text = required(m, "ID")?;
+    text.trim_start_matches('#')
+        .parse::<i64>()
+        .map_err(|_| Fault::usage(format!("an alert is a number from `alert list`, not {text:?}")))
+}
+
+fn alert_remove(store: &Store, m: &clap::ArgMatches, as_json: bool) -> Result<String, Fault> {
+    let id = alert_id(m)?;
+    let mut alerts = store.alerts();
+    let Some(at) = alerts.iter().position(|a| a.id == id) else {
+        return Err(Fault::not_found(format!("no alert {id}")));
+    };
+    let gone = alerts.remove(at);
+    store.set_alerts(&alerts);
+    let text = format!("removed {}", gone.describe(alert_decimals(&gone)));
+    said(as_json, json!({"removed": id, "message": text}), text)
+}
+
+fn alert_rearm(store: &Store, m: &clap::ArgMatches, as_json: bool) -> Result<String, Fault> {
+    let id = alert_id(m)?;
+    let mut alerts = store.alerts();
+    let Some(alert) = alerts.iter_mut().find(|a| a.id == id) else {
+        return Err(Fault::not_found(format!("no alert {id}")));
+    };
+    alert.rearm();
+    let text = format!("armed {}", alert.describe(alert_decimals(alert)));
+    let value = alert_json(alert);
+    store.set_alerts(&alerts);
+    said(as_json, json!({"alert": value, "message": text}), text)
+}
+
+fn alert_clear(store: &Store, m: &clap::ArgMatches, as_json: bool) -> Result<String, Fault> {
+    let fired_only = flag(m, "fired");
+    let mut alerts = store.alerts();
+    let before = alerts.len();
+    alerts.retain(|a| fired_only && a.is_armed());
+    store.set_alerts(&alerts);
+    let count = before - alerts.len();
+    let text = format!("removed {count} alert{}", if count == 1 { "" } else { "s" });
+    said(as_json, json!({"removed": count, "message": text}), text)
+}
+
+fn alert_check(store: &Store, as_json: bool, live: Option<&dyn Live>) -> Result<String, Fault> {
+    let fired = super::check_alerts(store, live);
+    let armed = store.alerts().iter().filter(|a| a.is_armed()).count();
+    let text = match (fired.as_slice(), live.is_some()) {
+        ([], true) => format!("{armed} armed; prices asked for, and the window checks them as they land"),
+        ([], false) => format!("nothing fired; {armed} armed"),
+        (fired, _) => fired.iter().map(|f| format!("{} — {}", f.title, f.body)).collect::<Vec<_>>().join("\n"),
+    };
+    said(
+        as_json,
+        json!({
+            "fired": fired.iter().map(|f| json!({"id": f.id, "title": f.title, "body": f.body})).collect::<Vec<_>>(),
+            "armed": armed,
+            "message": text,
+        }),
+        text,
+    )
+}
+
 /// Read or write the account positions are sized against.
 fn config_risk(store: &Store, m: &clap::ArgMatches, as_json: bool) -> Result<String, Fault> {
     use omacharts_engine::position::Stake;
@@ -7021,6 +7254,57 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// An alert is set, listed, armed again and taken away by its number,
+    /// and refuses what it cannot be: two conditions, or a line that is not
+    /// level.
+    #[test]
+    fn alerts_are_set_listed_rearmed_and_removed() {
+        let store = bare();
+        let out = run("alert add AAPL --above 250 --note breakout", &store);
+        assert_eq!(out.code, 0, "{}", out.err);
+        assert!(out.out.contains("#1 AAPL above 250.00 · armed"), "{}", out.out);
+        assert_eq!(run("alert add AAPL --above 1 --below 2", &store).code, super::super::EXIT_USAGE);
+        assert_eq!(run("alert add NOSUCHTHING --above 1", &store).code, super::super::EXIT_NOT_FOUND);
+        // No symbol and no window: no focused chart to take one from.
+        assert_eq!(run("alert add --above 1", &store).code, super::super::EXIT_NO_WINDOW);
+
+        let mut alerts = store.alerts();
+        alerts[0].fired = Some(1);
+        store.set_alerts(&alerts);
+        assert!(run("alert list", &store).out.contains("fired"));
+        assert!(run("alert rearm 1", &store).out.contains("armed #1"));
+        assert!(store.alerts()[0].is_armed());
+
+        run("alert add NVDA --cross 100", &store);
+        let mut alerts = store.alerts();
+        alerts[1].fired = Some(1);
+        store.set_alerts(&alerts);
+        assert!(run("alert clear --fired", &store).out.contains("removed 1 alert"));
+        assert_eq!(store.alerts().len(), 1);
+        assert_eq!(run("alert remove 9", &store).code, super::super::EXIT_NOT_FOUND);
+        assert!(run("alert remove 1", &store).out.contains("removed #1"));
+        assert!(run("alert list", &store).out.contains("no alerts"));
+    }
+
+    /// An alert follows a shared horizontal line, and only that.
+    #[test]
+    fn an_alert_follows_a_level_and_nothing_else() {
+        let store = bare();
+        run("chartbook create Macro --symbol AAPL --switch", &store);
+        run("chart drawing add hline --book Macro --chart pos:0 --from 2026-09-01,200 --to 2026-09-19,200", &store);
+        run("chart drawing add line --book Macro --chart pos:0 --from 2026-09-01,180 --to 2026-09-19,192", &store);
+        let out = run("alert add --drawing 1", &store);
+        assert_eq!(out.code, 0, "{}", out.err);
+        assert!(out.out.contains("AAPL cross 200.00 (line #1)"), "{}", out.out);
+        assert_eq!(run("alert add --drawing 2", &store).code, super::super::EXIT_REFUSED);
+        assert_eq!(run("alert add --drawing 7", &store).code, super::super::EXIT_NOT_FOUND);
+        assert_eq!(run("alert add NVDA --drawing 1", &store).code, super::super::EXIT_USAGE);
+        assert_eq!(crate::alerts::levels(&store, "AAPL", None), vec![200.0]);
+        // Moved, and the level goes with it.
+        run("chart drawing set --book Macro --chart pos:0 --id 1 --from 2026-09-01,210", &store);
+        assert_eq!(crate::alerts::levels(&store, "AAPL", None), vec![210.0]);
     }
 
     /// A drawing belongs to the symbol: added through one chart, it is listed
