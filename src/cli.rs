@@ -849,10 +849,10 @@ pub fn watchlist_json(store: &Store, refresh_first: bool, live: Option<&dyn Live
     // check above, so a poll that fired one answers with it gone.
     let alerts = store.alerts();
     let armed = alerts.iter().filter(|a| a.is_armed()).count();
+    let fired = alerts.iter().filter(|a| a.fired.is_some()).count();
     out.push_str(&format!(
-        "],\"colors\":{},\"alerts\":{{\"armed\":{armed},\"fired\":{}}},\"updatedAt\":{}}}",
+        "],\"colors\":{},\"alerts\":{{\"armed\":{armed},\"fired\":{fired}}},\"updatedAt\":{}}}",
         colors_json(store),
-        alerts.len() - armed,
         chrono::Utc::now().timestamp()
     ));
     out

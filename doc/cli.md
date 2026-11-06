@@ -848,22 +848,57 @@ properties dialog edits the three prices and the account.
 
 ## Price alerts
 
-An alert is a level on a symbol and a desktop notification when the price
-reaches it. `--above` and `--below` fire once the price is on that side.
-`--cross` fires when the price goes through the level in either direction.
-`--drawing` follows a shared horizontal line and fires when the price
-crosses it, even if the line has been moved since. With no symbol, the alert
-goes on the focused chart's symbol.
+An alert is a condition on a symbol and a desktop notification when the
+price meets it. With no symbol, the alert goes on the focused chart's
+symbol. Give one condition:
+
+| Flag | Fires when the price… |
+| --- | --- |
+| `--cross PRICE` | goes through the level, either way |
+| `--cross-up PRICE` | goes up through the level |
+| `--cross-down PRICE` | goes down through the level |
+| `--above PRICE` | is at or above the level |
+| `--below PRICE` | is at or below the level |
+| `--enter LOW,HIGH` | moves into the channel |
+| `--exit LOW,HIGH` | moves out of the channel |
+| `--drawing ID` | crosses a shared horizontal line, wherever it is moved |
+
+Each alert also has:
+
+- `--trigger once`, the default, which fires and then waits for `alert rearm`;
+- `--trigger every`, which fires each time the condition starts to hold and
+  stays armed;
+- `--expires`, which takes `3d`, `12h`, `2w`, `2026-12-31` or
+  `2026-12-31T16:00` in local time;
+- `--name`, which goes at the front of the notification's title;
+- `--note`, the message. `{{ticker}}`, `{{price}}` and `{{level}}` in it are
+  filled in when the alert fires.
 
 ```sh
-omacharts alert add AAPL --above 250 --note breakout
+omacharts alert add AAPL --cross-up 250 --name Breakout --trigger every --expires 2w
+omacharts alert add NVDA --enter 170,180 --note "{{ticker}} back in range at {{price}}"
 omacharts alert add --drawing 12          # the level line #12, wherever it is moved
-omacharts alert list
+omacharts alert list --state armed        # armed, paused, fired or expired
+omacharts alert edit 3 --cross-down 240 --expires never   # saving arms it again
+omacharts alert edit 4 --condition cross-up                # an alert on a line: keep the line
+omacharts alert pause 3                   # kept, but not checked
+omacharts alert resume 3
+omacharts alert clone 3
+omacharts alert log                       # when each fired, and at what price
 omacharts alert rearm 1                   # a fired alert, ready again
 omacharts alert remove 1
-omacharts alert clear --fired
+omacharts alert clear --fired             # or --expired; neither clears all of them
 omacharts alert check                     # fetch what is due and check now
 ```
+
+In the window, Ctrl+Shift+A opens the alert manager. Its Alerts tab lists
+every alert and can be searched and filtered by state. Each alert has a
+switch that pauses it, resumes it, or arms it again after it has fired, and
+buttons to edit, clone or remove it. The Log tab lists each firing with its
+price. Alt+Shift+A opens the editor for a new alert on the focused chart at
+its last price. Right-clicking the chart offers "Add alert at PRICE…" at the
+height that was clicked. A shared horizontal line's menu has "Alert when
+crossed", and once the line has an alert, "Edit alert…" and "Remove alert".
 
 Alerts are checked wherever a fresh price turns up, and the app does not
 poll for them:
@@ -875,10 +910,8 @@ poll for them:
 
 So with the window closed, an alert depends on the bar widget being
 installed (`omacharts plugin install`). Without the widget, run
-`omacharts alert check` from a timer of your own. An alert fires once, and
-`alert rearm` makes it ready again. Armed alerts are drawn on their charts as
-dotted amber lines. A shared horizontal line's menu has "Alert when crossed",
-which also offers to take the alert off again.
+`omacharts alert check` from a timer of your own. Armed alerts are drawn on
+their charts as dotted amber lines, two for a channel.
 
 ## Measuring a move
 

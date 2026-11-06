@@ -326,6 +326,40 @@ const INDICATOR_FLAGS: &[Flag] = &[
     Flag::valued("legend", "BOOL", "name it in the chart's legend; off by default for session_times").of(SWITCHES),
 ];
 
+/// The flags `alert add` and `alert edit` share — what it fires on, what it
+/// says, how often and until when — with each verb's own in the middle.
+/// Written once so the two verbs cannot drift.
+macro_rules! alert_flags {
+    ($($own:expr),* $(,)?) => {
+        &[
+            Flag::valued("above", "PRICE", "fire once the price is at or above this"),
+            Flag::valued("below", "PRICE", "fire once the price is at or below this"),
+            Flag::valued("cross", "PRICE", "fire when the price goes through this, either way"),
+            Flag::valued("cross-up", "PRICE", "fire when the price goes up through this"),
+            Flag::valued("cross-down", "PRICE", "fire when the price goes down through this"),
+            Flag::valued("enter", "LOW,HIGH", "fire when the price moves into this channel"),
+            Flag::valued("exit", "LOW,HIGH", "fire when the price moves out of this channel"),
+            $($own,)*
+            Flag::valued("name", "WORDS", "what the alert is called, in the list and the notification's title"),
+            Flag::valued("note", "WORDS", "the message after the price; {{ticker}}, {{price}} and {{level}} are filled in"),
+            Flag::valued("trigger", "WHEN", "once: fire and wait to be rearmed (default); every: fire each time it happens")
+                .of(&["once", "every"]),
+            Flag::valued("expires", "WHEN", "stop after 90m, 12h, 3d, 2w, a date such as 2026-12-31, a time such as 2026-12-31T16:00, or never"),
+        ]
+    };
+}
+
+const ALERT_ADD_FLAGS: &[Flag] = alert_flags![
+    Flag::valued("drawing", "ID", "follow a horizontal line, from `chart drawing list`: fire when the price crosses it, wherever it is moved"),
+    Flag::switch("paused", "set it, but do not check it until `alert resume`"),
+];
+
+const ALERT_EDIT_FLAGS: &[Flag] = alert_flags![
+    Flag::valued("condition", "KIND", "change only what it fires on, keeping its level: the way to change an alert on a line")
+        .of(&["cross", "cross-up", "cross-down", "above", "below", "enter", "exit"]),
+    Flag::valued("symbol", "SYMBOL", "move it to another instrument; not for an alert on a line"),
+];
+
 pub const SURFACE: &[Noun] = &[
     Noun {
         name: "status",
@@ -1145,34 +1179,69 @@ pub const SURFACE: &[Noun] = &[
     },
     Noun {
         name: "alert",
-        about: "Price alerts: a desktop notification when a symbol reaches a level, checked by the bar widget's poll and by live charts",
+        about: "Price alerts: a desktop notification when a symbol reaches a level or a channel, checked by the bar widget's poll and by live charts",
         local: false,
         verbs: &[
             Verb {
                 name: "list",
-                about: "Every alert, armed and fired, or only a symbol's",
+                about: "Every alert, or only a symbol's, or only those in one state",
                 args: &[Arg::opt("SYMBOL", "only this symbol's, such as AAPL or NESN.SW")],
-                flags: &[],
-                example: "omacharts alert list --json",
+                flags: &[Flag::valued("state", "STATE", "only alerts in this state")
+                    .of(&["armed", "paused", "fired", "expired"])],
+                example: "omacharts alert list --state armed --json",
                 json: true,
                 writes: false,
                 workspace: false,
             },
             Verb {
                 name: "add",
-                about: "Set an alert on a symbol (default: the focused chart's), at a price or on a horizontal line",
+                about: "Set an alert on a symbol (default: the focused chart's), at a price, on a channel or on a horizontal line",
                 args: &[Arg::opt("SYMBOL", "the instrument, such as AAPL or NESN.SW (default: the focused chart's)")],
-                flags: &[
-                    Flag::valued("above", "PRICE", "fire once the price is at or above this"),
-                    Flag::valued("below", "PRICE", "fire once the price is at or below this"),
-                    Flag::valued("cross", "PRICE", "fire when the price goes through this, either way"),
-                    Flag::valued("drawing", "ID", "follow a horizontal line, from `chart drawing list`: fire when the price crosses it, wherever it is moved"),
-                    Flag::valued("note", "WORDS", "what the notification says after the price"),
-                ],
-                example: "omacharts alert add AAPL --above 250 --note breakout",
+                flags: ALERT_ADD_FLAGS,
+                example: "omacharts alert add AAPL --cross-up 250 --trigger every --expires 2w --name Breakout",
                 json: true,
                 writes: true,
                 workspace: true,
+            },
+            Verb {
+                name: "edit",
+                about: "Change an alert: its condition, level, symbol, name, message, trigger or expiry; saving arms it again",
+                args: &[Arg::req("ID", "the alert, from `alert list`")],
+                flags: ALERT_EDIT_FLAGS,
+                example: "omacharts alert edit 3 --enter 190,200 --trigger every --expires 3d",
+                json: true,
+                writes: true,
+                workspace: false,
+            },
+            Verb {
+                name: "pause",
+                about: "Stop checking an alert, keeping it",
+                args: &[Arg::req("ID", "the alert, from `alert list`")],
+                flags: &[],
+                example: "omacharts alert pause 3",
+                json: true,
+                writes: true,
+                workspace: false,
+            },
+            Verb {
+                name: "resume",
+                about: "Check a paused alert again, measured from the next price",
+                args: &[Arg::req("ID", "the alert, from `alert list`")],
+                flags: &[],
+                example: "omacharts alert resume 3",
+                json: true,
+                writes: true,
+                workspace: false,
+            },
+            Verb {
+                name: "clone",
+                about: "Copy an alert to a new one, armed and with an empty log",
+                args: &[Arg::req("ID", "the alert, from `alert list`")],
+                flags: &[],
+                example: "omacharts alert clone 3",
+                json: true,
+                writes: true,
+                workspace: false,
             },
             Verb {
                 name: "remove",
@@ -1196,10 +1265,23 @@ pub const SURFACE: &[Noun] = &[
             },
             Verb {
                 name: "clear",
-                about: "Take every alert away, or only the ones that have fired",
+                about: "Take every alert away, or only the ones that have fired or expired",
                 args: &[],
-                flags: &[Flag::switch("fired", "only the alerts that have fired")],
+                flags: &[
+                    Flag::switch("fired", "only the alerts that have fired"),
+                    Flag::switch("expired", "only the alerts past their expiry"),
+                ],
                 example: "omacharts alert clear --fired",
+                json: true,
+                writes: true,
+                workspace: false,
+            },
+            Verb {
+                name: "log",
+                about: "When alerts fired and at what price, newest first: every alert's, or one's",
+                args: &[Arg::opt("ID", "only this alert's, from `alert list`")],
+                flags: &[Flag::switch("clear", "forget the log instead of showing it")],
+                example: "omacharts alert log 3",
                 json: true,
                 writes: true,
                 workspace: false,

@@ -173,9 +173,14 @@ pub fn dispatch(
         ("alert", _) => {
             let outcome = match verb {
                 "add" => alert_add(store, m, json, live.is_some()),
+                "edit" => alert_edit(store, m, json),
+                "pause" => alert_toggle(store, m, json, true),
+                "resume" => alert_toggle(store, m, json, false),
+                "clone" => alert_clone(store, m, json),
                 "remove" => alert_remove(store, m, json),
                 "rearm" => alert_rearm(store, m, json),
                 "clear" => alert_clear(store, m, json),
+                "log" => alert_log(store, m, json),
                 "check" => alert_check(store, json, live),
                 _ => Err(Fault::usage(format!("no such command: alert {verb}"))),
             };
@@ -4491,17 +4496,8 @@ const COLOURED_BARS: &str = "coloured_bar_scheme";
 /// `AAPL` or `NESN.SW` into a symbol and a suffix, through the catalogue so
 /// that a ticker with a dot in it is not split.
 fn alert_symbol(text: &str) -> Result<(String, Option<String>), Fault> {
-    let index = crate::inventory::everything();
-    let upper = text.trim().to_uppercase();
-    if let Some(found) = index.find(&upper, None) {
-        return Ok((found.symbol.clone(), found.suffix.clone()));
-    }
-    if let Some((symbol, suffix)) = upper.rsplit_once('.')
-        && let Some(found) = index.find(symbol, Some(suffix))
-    {
-        return Ok((found.symbol.clone(), found.suffix.clone()));
-    }
-    Err(Fault::not_found(format!("{text:?} is not an instrument this app knows; try `symbol search`")))
+    crate::alerts::resolve_symbol(&crate::inventory::everything(), text)
+        .ok_or_else(|| Fault::not_found(format!("{text:?} is not an instrument this app knows; try `symbol search`")))
 }
 
 /// How many decimals a level on a symbol is written to.
@@ -4510,19 +4506,32 @@ fn alert_decimals(alert: &omacharts_engine::alert::Alert) -> usize {
     omacharts_engine::price_decimals(0.0, alert.level, kind)
 }
 
+fn alert_now() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+fn alert_describe(alert: &omacharts_engine::alert::Alert) -> String {
+    alert.describe(alert_decimals(alert), alert_now())
+}
+
 fn alert_json(alert: &omacharts_engine::alert::Alert) -> Value {
     let mut value = serde_json::to_value(alert).unwrap_or_else(|_| json!({}));
-    value["armed"] = json!(alert.is_armed());
+    let state = alert.state(alert_now());
+    value["armed"] = json!(state == omacharts_engine::alert::State::Armed);
+    value["state"] = json!(state.key());
     value["display"] = json!(alert.spell_symbol());
     value
 }
 
 fn alert_list(store: &Store, m: &clap::ArgMatches, as_json: bool) -> Result<String, Fault> {
     let only = arg(m, "SYMBOL").map(|s| alert_symbol(s)).transpose()?;
+    let state = arg(m, "state");
+    let now = alert_now();
     let alerts: Vec<_> = store
         .alerts()
         .into_iter()
         .filter(|a| only.as_ref().is_none_or(|(symbol, suffix)| a.is_for(symbol, suffix.as_deref())))
+        .filter(|a| state.is_none_or(|s| a.state(now).key() == s))
         .collect();
     if as_json {
         return Ok(format!("{}\n", json!({"alerts": alerts.iter().map(alert_json).collect::<Vec<_>>()})));
@@ -4530,18 +4539,75 @@ fn alert_list(store: &Store, m: &clap::ArgMatches, as_json: bool) -> Result<Stri
     if alerts.is_empty() {
         return Ok("no alerts\n".into());
     }
-    Ok(alerts.iter().map(|a| a.describe(alert_decimals(a))).collect::<Vec<_>>().join("\n") + "\n")
+    Ok(alerts.iter().map(alert_describe).collect::<Vec<_>>().join("\n") + "\n")
+}
+
+/// The condition flag given, if any, as the condition, its level and a
+/// channel's other bound. More than one is a mistake rather than a choice.
+fn alert_condition(
+    m: &clap::ArgMatches,
+) -> Result<Option<(omacharts_engine::alert::Condition, f64, Option<f64>)>, Fault> {
+    use omacharts_engine::alert::Condition;
+    let positive = |id: &str, value: f64| -> Result<f64, Fault> {
+        match value.is_finite() && value > 0.0 {
+            true => Ok(value),
+            false => Err(Fault::usage(format!("--{id} is a price, more than zero"))),
+        }
+    };
+    let mut given = Vec::new();
+    for condition in Condition::ALL {
+        let id = condition.key();
+        let Some(text) = arg(m, id) else { continue };
+        if condition.is_channel() {
+            let bad = || Fault::usage(format!("--{id} takes LOW,HIGH, such as 190,200, not {text:?}"));
+            let (low, high) = text.split_once(',').ok_or_else(bad)?;
+            let low = positive(id, low.trim().parse().map_err(|_| bad())?)?;
+            let high = positive(id, high.trim().parse().map_err(|_| bad())?)?;
+            if low == high {
+                return Err(Fault::usage(format!("--{id} needs two different prices")));
+            }
+            given.push((condition, low.min(high), Some(low.max(high))));
+        } else {
+            given.push((condition, positive(id, number(m, id)?.unwrap_or_default())?, None));
+        }
+    }
+    match given.len() {
+        0 | 1 => Ok(given.pop()),
+        _ => Err(Fault::usage(
+            "give one of --above, --below, --cross, --cross-up, --cross-down, --enter or --exit".into(),
+        )),
+    }
+}
+
+/// Name, note, trigger and expiry, onto an alert, from whichever were given.
+fn alert_details(m: &clap::ArgMatches, alert: &mut omacharts_engine::alert::Alert) -> Result<(), Fault> {
+    use omacharts_engine::alert::Frequency;
+    if let Some(name) = arg(m, "name") {
+        alert.name = name.trim().to_string();
+    }
+    if let Some(note) = arg(m, "note") {
+        alert.note = note.clone();
+    }
+    if let Some(trigger) = arg(m, "trigger") {
+        alert.frequency = Frequency::from_key(trigger)
+            .ok_or_else(|| Fault::usage(format!("--trigger is once or every, not {trigger:?}")))?;
+    }
+    if let Some(when) = arg(m, "expires") {
+        alert.expires = crate::alerts::parse_expiry(when, alert_now()).map_err(Fault::usage)?;
+    }
+    Ok(())
+}
+
+/// The price now, which is what a crossing is measured from.
+fn alert_last_price(store: &Store, alert: &omacharts_engine::alert::Alert) -> Option<f64> {
+    let index = crate::inventory::everything();
+    let provider = crate::feeds::selected(store);
+    let instrument = index.find(&alert.symbol, alert.suffix.as_deref())?;
+    super::quote(store, provider.as_ref(), instrument).map(|q| q.last)
 }
 
 fn alert_add(store: &Store, m: &clap::ArgMatches, as_json: bool, window: bool) -> Result<String, Fault> {
     use omacharts_engine::alert::{next_id, Alert, Condition};
-    let price = |id: &str| -> Result<Option<f64>, Fault> {
-        let value = number(m, id)?;
-        if value.is_some_and(|v| !v.is_finite() || v <= 0.0) {
-            return Err(Fault::usage(format!("--{id} is a price, more than zero")));
-        }
-        Ok(value)
-    };
     let drawing = match arg(m, "drawing") {
         None => None,
         Some(text) => Some(
@@ -4549,20 +4615,15 @@ fn alert_add(store: &Store, m: &clap::ArgMatches, as_json: bool, window: bool) -
                 .map_err(|_| Fault::usage(format!("--drawing takes an id from `chart drawing list`, not {text:?}")))?,
         ),
     };
-    let given: Vec<(Condition, f64)> = [
-        (Condition::Above, price("above")?),
-        (Condition::Below, price("below")?),
-        (Condition::Cross, price("cross")?),
-    ]
-    .into_iter()
-    .filter_map(|(c, p)| p.map(|p| (c, p)))
-    .collect();
-    if given.len() + usize::from(drawing.is_some()) != 1 {
-        return Err(Fault::usage("give one of --above, --below, --cross or --drawing".into()));
+    let given = alert_condition(m)?;
+    if usize::from(given.is_some()) + usize::from(drawing.is_some()) != 1 {
+        return Err(Fault::usage(
+            "give one of --above, --below, --cross, --cross-up, --cross-down, --enter, --exit or --drawing".into(),
+        ));
     }
 
     // The symbol: named, the line's, or the focused chart's.
-    let (symbol, suffix, condition, level) = match (drawing, given.first()) {
+    let (symbol, suffix, condition, level, upper) = match (drawing, given) {
         (Some(id), _) => {
             if id < 0 {
                 return Err(Fault::refused(
@@ -4578,9 +4639,9 @@ fn alert_add(store: &Store, m: &clap::ArgMatches, as_json: bool, window: bool) -
                     line.kind.key()
                 )));
             }
-            (symbol, suffix, Condition::Cross, line.from.price)
+            (symbol, suffix, Condition::Cross, line.from.price, None)
         }
-        (None, Some((condition, level))) => {
+        (None, Some((condition, level, upper))) => {
             let (symbol, suffix) = match arg(m, "SYMBOL") {
                 Some(text) => alert_symbol(text)?,
                 None => {
@@ -4604,7 +4665,7 @@ fn alert_add(store: &Store, m: &clap::ArgMatches, as_json: bool, window: bool) -
                     (symbol, suffix)
                 }
             };
-            (symbol, suffix, *condition, *level)
+            (symbol, suffix, condition, level, upper)
         }
         (None, None) => unreachable!("one of them was counted above"),
     };
@@ -4618,28 +4679,119 @@ fn alert_add(store: &Store, m: &clap::ArgMatches, as_json: bool, window: bool) -
     }
 
     let mut alerts = store.alerts();
-    let mut alert = Alert::new(&symbol, suffix.as_deref(), condition, level, chrono::Utc::now().timestamp());
+    let mut alert = Alert::new(&symbol, suffix.as_deref(), condition, level, alert_now());
     alert.id = next_id(&alerts);
+    alert.upper = upper;
     alert.drawing = drawing;
-    alert.note = arg(m, "note").cloned().unwrap_or_default();
+    alert.paused = flag(m, "paused");
+    alert_details(m, &mut alert)?;
     // A crossing is measured from the price as it is now, so it is
     // remembered at once when there is one; without it the first check
     // only learns where the price is.
-    let index = crate::inventory::everything();
-    let provider = crate::feeds::selected(store);
-    if let Some(instrument) = index.find(&symbol, suffix.as_deref()) {
-        alert.last = super::quote(store, provider.as_ref(), instrument).map(|q| q.last);
-    }
-    let decimals = alert_decimals(&alert);
-    let text = format!("set {}", alert.describe(decimals));
+    alert.last = alert_last_price(store, &alert);
+    let text = format!("set {}", alert_describe(&alert));
     let value = alert_json(&alert);
     alerts.push(alert);
     store.set_alerts(&alerts);
     said(as_json, json!({"alert": value, "message": text}), text)
 }
 
+/// Change an alert. Saving arms it again, the way saving a stopped alert
+/// does anywhere else: an edit is somebody saying what they now want told.
+fn alert_edit(store: &Store, m: &clap::ArgMatches, as_json: bool) -> Result<String, Fault> {
+    use omacharts_engine::alert::Condition;
+    let id = alert_id(m)?;
+    let mut alerts = store.alerts();
+    let Some(alert) = alerts.iter_mut().find(|a| a.id == id) else {
+        return Err(Fault::not_found(format!("no alert {id}")));
+    };
+    let given = alert_condition(m)?;
+    let kind = arg(m, "condition")
+        .map(|k| Condition::from_key(k).ok_or_else(|| Fault::usage(format!("no condition called {k:?}"))))
+        .transpose()?;
+    if given.is_some() && kind.is_some() {
+        return Err(Fault::usage("--condition changes the kind and keeps the level; give it or a level, not both".into()));
+    }
+    if let Some((condition, level, upper)) = given {
+        if let Some(line) = alert.drawing {
+            return Err(Fault::refused(format!(
+                "#{id} follows line #{line}: move the line to move it, or use --condition to change what it fires on"
+            )));
+        }
+        alert.condition = condition;
+        alert.level = level;
+        alert.upper = upper;
+    }
+    if let Some(condition) = kind {
+        if condition.is_channel() {
+            if let Some(line) = alert.drawing {
+                return Err(Fault::refused(format!("#{id} follows line #{line}; a channel needs two prices of its own")));
+            }
+            if alert.upper.is_none() {
+                return Err(Fault::usage(format!("a channel needs two prices: --{} LOW,HIGH", condition.key())));
+            }
+        }
+        alert.condition = condition;
+    }
+    if let Some(text) = arg(m, "symbol") {
+        if let Some(line) = alert.drawing {
+            return Err(Fault::refused(format!("#{id} follows line #{line}, which is on {}", alert.spell_symbol())));
+        }
+        let (symbol, suffix) = alert_symbol(text)?;
+        if !alert.is_for(&symbol, suffix.as_deref()) {
+            alert.symbol = symbol;
+            alert.suffix = suffix;
+            alert.last = None;
+        }
+    }
+    alert_details(m, alert)?;
+    alert.fired = None;
+    if alert.last.is_none() {
+        alert.last = alert_last_price(store, alert);
+    }
+    let text = format!("changed {}", alert_describe(alert));
+    let value = alert_json(alert);
+    store.set_alerts(&alerts);
+    said(as_json, json!({"alert": value, "message": text}), text)
+}
+
+fn alert_toggle(store: &Store, m: &clap::ArgMatches, as_json: bool, pause: bool) -> Result<String, Fault> {
+    let id = alert_id(m)?;
+    let mut alerts = store.alerts();
+    let Some(alert) = alerts.iter_mut().find(|a| a.id == id) else {
+        return Err(Fault::not_found(format!("no alert {id}")));
+    };
+    match pause {
+        true => alert.pause(),
+        false => alert.resume(),
+    }
+    let text = format!("{} {}", if pause { "paused" } else { "resumed" }, alert_describe(alert));
+    let value = alert_json(alert);
+    store.set_alerts(&alerts);
+    said(as_json, json!({"alert": value, "message": text}), text)
+}
+
+fn alert_clone(store: &Store, m: &clap::ArgMatches, as_json: bool) -> Result<String, Fault> {
+    let id = alert_id(m)?;
+    let mut alerts = store.alerts();
+    let Some(alert) = alerts.iter().find(|a| a.id == id) else {
+        return Err(Fault::not_found(format!("no alert {id}")));
+    };
+    let mut copy = alert.duplicate(alert_now());
+    copy.id = omacharts_engine::alert::next_id(&alerts);
+    let text = format!("set {}", alert_describe(&copy));
+    let value = alert_json(&copy);
+    alerts.push(copy);
+    store.set_alerts(&alerts);
+    said(as_json, json!({"alert": value, "message": text}), text)
+}
+
 fn alert_id(m: &clap::ArgMatches) -> Result<i64, Fault> {
     let text = required(m, "ID")?;
+    alert_id_text(text)
+}
+
+fn alert_id_text(text: &str) -> Result<i64, Fault> {
     text.trim_start_matches('#')
         .parse::<i64>()
         .map_err(|_| Fault::usage(format!("an alert is a number from `alert list`, not {text:?}")))
@@ -4653,7 +4805,7 @@ fn alert_remove(store: &Store, m: &clap::ArgMatches, as_json: bool) -> Result<St
     };
     let gone = alerts.remove(at);
     store.set_alerts(&alerts);
-    let text = format!("removed {}", gone.describe(alert_decimals(&gone)));
+    let text = format!("removed {}", alert_describe(&gone));
     said(as_json, json!({"removed": id, "message": text}), text)
 }
 
@@ -4664,21 +4816,80 @@ fn alert_rearm(store: &Store, m: &clap::ArgMatches, as_json: bool) -> Result<Str
         return Err(Fault::not_found(format!("no alert {id}")));
     };
     alert.rearm();
-    let text = format!("armed {}", alert.describe(alert_decimals(alert)));
+    let text = format!("armed {}", alert_describe(alert));
     let value = alert_json(alert);
     store.set_alerts(&alerts);
     said(as_json, json!({"alert": value, "message": text}), text)
 }
 
 fn alert_clear(store: &Store, m: &clap::ArgMatches, as_json: bool) -> Result<String, Fault> {
-    let fired_only = flag(m, "fired");
+    use omacharts_engine::alert::State;
+    let (fired, expired) = (flag(m, "fired"), flag(m, "expired"));
+    let now = alert_now();
     let mut alerts = store.alerts();
     let before = alerts.len();
-    alerts.retain(|a| fired_only && a.is_armed());
+    alerts.retain(|a| match (fired, expired) {
+        (false, false) => false,
+        _ => {
+            let state = a.state(now);
+            !((fired && state == State::Fired) || (expired && state == State::Expired))
+        }
+    });
     store.set_alerts(&alerts);
     let count = before - alerts.len();
     let text = format!("removed {count} alert{}", if count == 1 { "" } else { "s" });
     said(as_json, json!({"removed": count, "message": text}), text)
+}
+
+fn alert_log(store: &Store, m: &clap::ArgMatches, as_json: bool) -> Result<String, Fault> {
+    let only = arg(m, "ID").map(|t| alert_id_text(t)).transpose()?;
+    let mut alerts = store.alerts();
+    if let Some(id) = only
+        && !alerts.iter().any(|a| a.id == id)
+    {
+        return Err(Fault::not_found(format!("no alert {id}")));
+    }
+    let mine = |a: &omacharts_engine::alert::Alert| only.is_none_or(|id| a.id == id);
+    if flag(m, "clear") {
+        let mut count = 0;
+        for alert in alerts.iter_mut().filter(|a| mine(a)) {
+            count += alert.log.len();
+            alert.log.clear();
+        }
+        store.set_alerts(&alerts);
+        let text = format!("forgot {count} firing{}", if count == 1 { "" } else { "s" });
+        return said(as_json, json!({"cleared": count, "message": text}), text);
+    }
+    let shown: Vec<_> = alerts.iter().filter(|a| mine(a)).cloned().collect();
+    let hits = crate::alerts::hits(&shown);
+    if as_json {
+        let rows: Vec<Value> = hits
+            .iter()
+            .map(|(a, h)| {
+                json!({"id": a.id, "symbol": a.spell_symbol(), "name": a.name, "condition": a.condition.key(),
+                       "at": h.at, "price": h.price.is_finite().then_some(h.price)})
+            })
+            .collect();
+        return Ok(format!("{}\n", json!({"log": rows})));
+    }
+    if hits.is_empty() {
+        return Ok("nothing has fired\n".into());
+    }
+    let lines: Vec<String> = hits
+        .iter()
+        .map(|(a, h)| {
+            let decimals = alert_decimals(a);
+            let at = chrono::DateTime::from_timestamp(h.at, 0)
+                .map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_default();
+            let price = match h.price.is_finite() {
+                true => format!(" at {:.decimals$}", h.price),
+                false => String::new(),
+            };
+            format!("{at}  #{} {} {} {}{price}", a.id, a.spell_symbol(), a.condition.key(), a.spell_level(decimals))
+        })
+        .collect();
+    Ok(lines.join("\n") + "\n")
 }
 
 fn alert_check(store: &Store, as_json: bool, live: Option<&dyn Live>) -> Result<String, Fault> {
@@ -7290,6 +7501,46 @@ mod tests {
         assert!(run("alert list", &store).out.contains("no alerts"));
     }
 
+    /// An alert is edited, paused, resumed and cloned by its number, and a
+    /// channel takes two prices.
+    #[test]
+    fn alerts_are_edited_paused_and_cloned() {
+        let store = bare();
+        let out = run("alert add AAPL --enter 190,200 --trigger every --expires 2w --name Range", &store);
+        assert_eq!(out.code, 0, "{}", out.err);
+        assert!(out.out.contains("#1 [Range] AAPL enter 190.00–200.00 · every time · armed · until"), "{}", out.out);
+        assert_eq!(run("alert add AAPL --enter 190", &store).code, super::super::EXIT_USAGE);
+        assert_eq!(run("alert add AAPL --cross-up 1 --cross 2", &store).code, super::super::EXIT_USAGE);
+        assert_eq!(run("alert add AAPL --above 1 --expires yesterday", &store).code, super::super::EXIT_USAGE);
+
+        let out = run("alert edit 1 --cross-down 180 --note {{ticker}}@{{price}} --expires never", &store);
+        assert_eq!(out.code, 0, "{}", out.err);
+        let a = &store.alerts()[0];
+        assert_eq!((a.condition.key(), a.level, a.upper, a.expires), ("cross-down", 180.0, None, None));
+        assert_eq!(a.note, "{{ticker}}@{{price}}");
+        assert_eq!(run("alert edit 1 --condition exit", &store).code, super::super::EXIT_USAGE);
+        assert_eq!(run("alert edit 1 --condition above --cross 3", &store).code, super::super::EXIT_USAGE);
+        assert!(run("alert edit 1 --condition above --symbol NVDA", &store).out.contains("NVDA above 180.00"));
+
+        assert!(run("alert pause 1", &store).out.contains("· paused"));
+        assert!(run("alert list --state paused", &store).out.contains("#1"));
+        assert!(run("alert list --state armed", &store).out.contains("no alerts"));
+        assert!(run("alert resume 1", &store).out.contains("· armed"));
+
+        let mut alerts = store.alerts();
+        alerts[0].log.push(omacharts_engine::alert::Hit { at: 1_700_000_000, price: 181.5 });
+        alerts[0].fired = Some(1_700_000_000);
+        store.set_alerts(&alerts);
+        let out = run("alert clone 1", &store);
+        assert!(out.out.contains("set #2 [Range] NVDA above 180.00"), "{}", out.out);
+        assert!(store.alerts()[1].log.is_empty() && store.alerts()[1].is_armed());
+        assert!(run("alert log", &store).out.contains("#1 NVDA above 180.00 at 181.50"));
+        assert!(run("alert log 2", &store).out.contains("nothing has fired"));
+        assert!(run("alert edit 1 --name Moved", &store).out.contains("armed"), "an edit arms it again");
+        assert!(run("alert log --clear", &store).out.contains("forgot 1 firing"));
+        assert_eq!(run("alert log 9", &store).code, super::super::EXIT_NOT_FOUND);
+    }
+
     /// An alert follows a shared horizontal line, and only that.
     #[test]
     fn an_alert_follows_a_level_and_nothing_else() {
@@ -7307,6 +7558,9 @@ mod tests {
         // Moved, and the level goes with it.
         run("chart drawing set --book Macro --chart pos:0 --id 1 --from 2026-09-01,210", &store);
         assert_eq!(crate::alerts::levels(&store, "AAPL", None), vec![210.0]);
+        assert_eq!(run("alert edit 1 --cross 5", &store).code, super::super::EXIT_REFUSED);
+        assert!(run("alert edit 1 --condition cross-up", &store).out.contains("cross-up"));
+        assert_eq!(run("alert edit 1 --symbol NVDA", &store).code, super::super::EXIT_REFUSED);
     }
 
     /// A drawing belongs to the symbol: added through one chart, it is listed

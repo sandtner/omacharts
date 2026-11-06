@@ -151,6 +151,7 @@ const SHORTCUT_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl+Shift+S", "Chart settings"),
             ("Ctrl+,", "Preferences"),
             ("Ctrl+Shift+A", "Alerts"),
+            ("Alt+Shift+A", "New alert on this chart"),
             ("F10", "Main menu"),
             ("? · Ctrl+?", "This list"),
             ("Ctrl+Q", "Quit"),
@@ -4963,6 +4964,11 @@ impl Window {
         alerts.connect_activate(move |_, _| crate::ui::alerts::present(&this));
         self.window.add_action(&alerts);
 
+        let new_alert = gio::SimpleAction::new("new-alert", None);
+        let this = self.clone();
+        new_alert.connect_activate(move |_, _| crate::ui::alert_editor::present_new(&this, None));
+        self.window.add_action(&new_alert);
+
         let shortcuts = gio::SimpleAction::new("shortcuts", None);
         let this = self.clone();
         shortcuts.connect_activate(move |_, _| this.show_shortcuts());
@@ -8160,6 +8166,7 @@ impl Window {
     /// how many there are.
     pub fn refresh_alert_levels(&self) {
         crate::bar_plugin::notify_changed();
+        crate::ui::alerts::changed();
         for pane in self.panes.borrow().iter() {
             let instrument = pane.instrument.borrow().clone();
             if let Some(instrument) = instrument {
@@ -8476,7 +8483,10 @@ impl Window {
         // A shared level can carry an alert; a chart's own cannot, since an
         // alert is about the symbol, not one chart of it.
         if drawing.kind == omacharts_engine::DrawingKind::Horizontal && drawing.id > 0 {
-            let has = self.store.alerts().iter().any(|a| a.drawing == Some(drawing.id) && a.is_armed());
+            let has = self.store.alerts().iter().any(|a| a.drawing == Some(drawing.id));
+            if has {
+                edit.append(Some("Edit alert…"), Some("chart.drawing-alert-edit"));
+            }
             let label = match has {
                 true => "Remove alert",
                 false => "Alert when crossed",
@@ -8733,6 +8743,20 @@ impl Window {
 
     fn chart_menu(self: &Rc<Self>, x: f64, y: f64) {
         let menu = gio::Menu::new();
+
+        // An alert at the height that was clicked: the price is where the
+        // pointer is, which is what "alert me here" means.
+        let pane = self.focused_pane();
+        let instrument = pane.instrument.borrow().clone();
+        if let (Some(price), Some(instrument)) = (pane.view.price_at_point(x, y), instrument) {
+            let decimals = omacharts_engine::price_decimals(0.0, price, Some(instrument.kind));
+            let label = format!("Add alert at {}…", omacharts_engine::grouped_decimals(price, decimals));
+            let item = gio::MenuItem::new(Some(&label), None);
+            item.set_action_and_target_value(Some("chart.alert-at"), Some(&price.to_variant()));
+            let alerts = gio::Menu::new();
+            alerts.append_item(&item);
+            menu.append_section(None, &alerts);
+        }
 
         // Paste first: it is the one thing in this menu that puts something
         // on the chart rather than changing how the chart is drawn, and it
@@ -9195,6 +9219,26 @@ impl Window {
         let this = self.clone();
         drawing_alert.connect_activate(move |_, _| this.toggle_line_alert());
         actions.add_action(&drawing_alert);
+
+        let drawing_alert_edit = gio::SimpleAction::new("drawing-alert-edit", None);
+        let this = self.clone();
+        drawing_alert_edit.connect_activate(move |_, _| {
+            let Some(line) = this.focused_pane().view.selected_drawing() else { return };
+            let alert = this.store.alerts().into_iter().find(|a| a.drawing == Some(line.id));
+            if let Some(alert) = alert {
+                crate::ui::alert_editor::present(&this, alert);
+            }
+        });
+        actions.add_action(&drawing_alert_edit);
+
+        // An alert at the price under the pointer, from the chart's menu.
+        let alert_at = gio::SimpleAction::new("alert-at", Some(glib::VariantTy::DOUBLE));
+        let this = self.clone();
+        alert_at.connect_activate(move |_, value| {
+            let price = value.and_then(|v| v.get::<f64>());
+            crate::ui::alert_editor::present_new(&this, price);
+        });
+        actions.add_action(&alert_at);
 
         let measure = gio::SimpleAction::new("measure", None);
         let this = self.clone();

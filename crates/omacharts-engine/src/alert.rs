@@ -1,44 +1,96 @@
-//! Price alerts: a level on a symbol, and the rule that says when a price has
-//! reached it.
+//! Price alerts: a level (or a channel) on a symbol, and the rule that says
+//! when a price has reached it.
 //!
 //! Nothing here fetches or notifies. The app asks [`Alert::check`] with the
 //! freshest price it has — a quote the bar widget's poll brought in, a bar a
 //! loader reply landed, a tick off a live stream — and acts on the answer.
 //! Keeping the rule in one pure function is what lets the window and a
 //! process with no window agree on exactly when an alert fires.
+//!
+//! Every field added after the first release has a default, so a list
+//! written by an older build reads as alerts that fire once, never expire
+//! and are not paused — which is what they were.
 
 use serde::{Deserialize, Serialize};
 
 /// The settings key the alerts are stored under, as one JSON list.
 pub const SETTING: &str = "alerts";
 
+/// How many firings an alert remembers, newest kept.
+pub const LOG_LIMIT: usize = 50;
+
 /// What a price has to do to fire an alert.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum Condition {
-    /// At or above the level, however it got there.
-    Above,
-    /// At or below the level.
-    Below,
     /// Through the level, either way, since the last price seen. The one to
     /// put on a line on the chart: a line moved to the other side of the
     /// price keeps meaning "tell me when it gets here".
     Cross,
+    /// Through the level from below.
+    CrossUp,
+    /// Through the level from above.
+    CrossDown,
+    /// At or above the level, however it got there.
+    Above,
+    /// At or below the level.
+    Below,
+    /// Into the channel between the level and the upper bound, from outside.
+    Enter,
+    /// Out of the channel, either side, from inside.
+    Exit,
 }
 
 impl Condition {
-    pub const ALL: [Condition; 3] = [Condition::Above, Condition::Below, Condition::Cross];
+    pub const ALL: [Condition; 7] = [
+        Condition::Cross,
+        Condition::CrossUp,
+        Condition::CrossDown,
+        Condition::Above,
+        Condition::Below,
+        Condition::Enter,
+        Condition::Exit,
+    ];
 
     pub fn key(self) -> &'static str {
         match self {
+            Condition::Cross => "cross",
+            Condition::CrossUp => "cross-up",
+            Condition::CrossDown => "cross-down",
             Condition::Above => "above",
             Condition::Below => "below",
-            Condition::Cross => "cross",
+            Condition::Enter => "enter",
+            Condition::Exit => "exit",
+        }
+    }
+
+    /// How a person reads it in a list: `Crossing up`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Condition::Cross => "Crossing",
+            Condition::CrossUp => "Crossing up",
+            Condition::CrossDown => "Crossing down",
+            Condition::Above => "At or above",
+            Condition::Below => "At or below",
+            Condition::Enter => "Entering channel",
+            Condition::Exit => "Exiting channel",
         }
     }
 
     pub fn from_key(key: &str) -> Option<Condition> {
-        Condition::ALL.into_iter().find(|c| c.key().eq_ignore_ascii_case(key))
+        let key = key.replace('_', "-");
+        Condition::ALL.into_iter().find(|c| c.key().eq_ignore_ascii_case(&key))
+    }
+
+    /// A channel has two bounds; everything else one level.
+    pub fn is_channel(self) -> bool {
+        matches!(self, Condition::Enter | Condition::Exit)
+    }
+
+    /// Whether it needs a price before this one to mean anything: a crossing
+    /// or an entry is a move, not a place.
+    pub fn is_move(self) -> bool {
+        !matches!(self, Condition::Above | Condition::Below)
     }
 
     /// How a fired alert says what happened: `rose to`, `crossed`.
@@ -46,10 +98,77 @@ impl Condition {
         match self {
             Condition::Above => "rose to",
             Condition::Below => "fell to",
+            Condition::CrossUp => "rose through",
+            Condition::CrossDown => "fell through",
             Condition::Cross => match from {
                 Some(from) if from > level => "fell through",
                 _ => "rose through",
             },
+            Condition::Enter => "entered",
+            Condition::Exit => "left",
+        }
+    }
+}
+
+/// How often an alert may fire.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Frequency {
+    /// Fire, then wait to be armed again.
+    #[default]
+    Once,
+    /// Fire each time the condition becomes true, and stay armed. A level
+    /// condition fires on getting there, not on every price while there.
+    Every,
+}
+
+impl Frequency {
+    pub const ALL: [Frequency; 2] = [Frequency::Once, Frequency::Every];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Frequency::Once => "once",
+            Frequency::Every => "every",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Frequency::Once => "Only once",
+            Frequency::Every => "Every time",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Frequency> {
+        Frequency::ALL.into_iter().find(|f| f.key().eq_ignore_ascii_case(key))
+    }
+}
+
+/// One firing, for the log.
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+pub struct Hit {
+    /// When, in seconds.
+    pub at: i64,
+    /// The price that fired it.
+    pub price: f64,
+}
+
+/// Where an alert stands, for a list to show and filter on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum State {
+    Armed,
+    Paused,
+    Fired,
+    Expired,
+}
+
+impl State {
+    pub fn key(self) -> &'static str {
+        match self {
+            State::Armed => "armed",
+            State::Paused => "paused",
+            State::Fired => "fired",
+            State::Expired => "expired",
         }
     }
 }
@@ -62,33 +181,59 @@ pub struct Alert {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suffix: Option<String>,
     pub condition: Condition,
-    /// The price. For an alert on a drawing this is where the line was when
-    /// last looked at; the line is what counts, see [`Alert::drawing`].
+    /// The price, or the channel's first bound. For an alert on a drawing
+    /// this is where the line was when last looked at; the line is what
+    /// counts, see [`Alert::drawing`].
     pub level: f64,
+    /// The channel's other bound, for [`Condition::is_channel`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upper: Option<f64>,
     /// A horizontal line this alert follows: move the line and the alert
     /// moves with it. The drawing's id in the store.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drawing: Option<i64>,
-    /// Words to put in the notification.
+    /// What the alert is called in the list, and at the front of the
+    /// notification.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// Words to put in the notification. `{{ticker}}`, `{{price}}` and
+    /// `{{level}}` are put in as it fires.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub note: String,
+    #[serde(default, skip_serializing_if = "is_once")]
+    pub frequency: Frequency,
+    /// When it stops, in seconds. An expired alert stays in the list until
+    /// somebody removes it or gives it a new date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires: Option<i64>,
+    /// Kept, and not checked, until resumed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub paused: bool,
     /// When it was set, in seconds.
     pub created: i64,
     /// The last price it was checked against, which is what a crossing is
     /// measured from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last: Option<f64>,
-    /// When it fired. A fired alert is done until it is armed again: a level
-    /// that fires every two minutes while the price sits on it is noise.
+    /// When it fired, for an alert that fires once. A fired alert is done
+    /// until it is armed again: a level that fires every two minutes while
+    /// the price sits on it is noise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fired: Option<i64>,
+    /// Every firing, newest last, at most [`LOG_LIMIT`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub log: Vec<Hit>,
+}
+
+fn is_once(f: &Frequency) -> bool {
+    *f == Frequency::Once
 }
 
 /// What a check found.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Fired {
     pub id: i64,
-    /// `AAPL rose through 195.00`.
+    /// `AAPL rose through 195.00`, after the alert's name when it has one.
     pub title: String,
     /// `now 195.12 · breakout`.
     pub body: String,
@@ -102,16 +247,45 @@ impl Alert {
             suffix: suffix.filter(|s| !s.is_empty()).map(str::to_string),
             condition,
             level,
+            upper: None,
             drawing: None,
+            name: String::new(),
             note: String::new(),
+            frequency: Frequency::Once,
+            expires: None,
+            paused: false,
             created,
             last: None,
             fired: None,
+            log: Vec::new(),
         }
     }
 
+    /// Whether it would fire now: not fired, not paused, not past its date.
     pub fn is_armed(&self) -> bool {
-        self.fired.is_none()
+        self.is_armed_at(chrono::Utc::now().timestamp())
+    }
+
+    pub fn is_armed_at(&self, now: i64) -> bool {
+        self.state(now) == State::Armed
+    }
+
+    pub fn state(&self, now: i64) -> State {
+        if self.fired.is_some() {
+            State::Fired
+        } else if self.expires.is_some_and(|at| at <= now) {
+            State::Expired
+        } else if self.paused {
+            State::Paused
+        } else {
+            State::Armed
+        }
+    }
+
+    /// The channel's bounds, low first. A single level is a channel of none.
+    pub fn bounds(&self) -> (f64, f64) {
+        let other = self.upper.unwrap_or(self.level);
+        (self.level.min(other), self.level.max(other))
     }
 
     /// The symbol as people write it: `AAPL`, `NESN.SW`.
@@ -126,42 +300,88 @@ impl Alert {
         self.symbol == symbol && self.suffix.as_deref() == suffix.filter(|s| !s.is_empty())
     }
 
+    /// The level, or the channel, as figures: `195.00`, `190.00–200.00`.
+    pub fn spell_level(&self, decimals: usize) -> String {
+        match self.condition.is_channel() {
+            true => {
+                let (lo, hi) = self.bounds();
+                format!("{lo:.decimals$}–{hi:.decimals$}")
+            }
+            false => format!("{:.decimals$}", self.level),
+        }
+    }
+
+    /// Whether `price` satisfies the condition, given the one before it.
+    fn hits(&self, from: Option<f64>, price: f64) -> bool {
+        let level = self.level;
+        let (lo, hi) = self.bounds();
+        let inside = |p: f64| (lo..=hi).contains(&p);
+        match self.condition {
+            Condition::Above => price >= level,
+            Condition::Below => price <= level,
+            Condition::Cross => from.is_some_and(|from| {
+                (from < level && price >= level) || (from > level && price <= level)
+            }),
+            Condition::CrossUp => from.is_some_and(|from| from < level && price >= level),
+            Condition::CrossDown => from.is_some_and(|from| from > level && price <= level),
+            Condition::Enter => from.is_some_and(|from| !inside(from) && inside(price)),
+            Condition::Exit => from.is_some_and(|from| inside(from) && !inside(price)),
+        }
+    }
+
     /// Put a price to the alert, at `now`, and say whether that fired it.
     ///
     /// Remembers the price either way, so the next check measures a crossing
     /// from here. A crossing alert seeing its first price only remembers
     /// it: with nothing before, there is nothing to have crossed from.
     pub fn check(&mut self, price: f64, now: i64, decimals: usize) -> Option<Fired> {
-        if !price.is_finite() || !self.is_armed() {
+        if !price.is_finite() || !self.is_armed_at(now) {
             return None;
         }
         let from = self.last.replace(price);
-        let level = self.level;
-        let hit = match self.condition {
-            Condition::Above => price >= level,
-            Condition::Below => price <= level,
-            Condition::Cross => from.is_some_and(|from| {
-                (from < level && price >= level) || (from > level && price <= level)
-            }),
-        };
+        let mut hit = self.hits(from, price);
+        // Every time, for a place rather than a move, means every time it
+        // gets there: not every price while it stays.
+        if hit && self.frequency == Frequency::Every && !self.condition.is_move() {
+            hit = !from.is_some_and(|from| self.hits(None, from));
+        }
         if !hit {
             return None;
         }
-        self.fired = Some(now);
-        let note = match self.note.is_empty() {
+        if self.frequency == Frequency::Once {
+            self.fired = Some(now);
+        }
+        self.log.push(Hit { at: now, price });
+        if self.log.len() > LOG_LIMIT {
+            self.log.drain(..self.log.len() - LOG_LIMIT);
+        }
+        let note = self.message(price, decimals);
+        let note = match note.is_empty() {
             true => String::new(),
-            false => format!(" · {}", self.note),
+            false => format!(" · {note}"),
         };
+        let what = format!(
+            "{} {} {}",
+            self.spell_symbol(),
+            self.condition.verb(from, self.level),
+            self.spell_level(decimals)
+        );
         Some(Fired {
             id: self.id,
-            title: format!(
-                "{} {} {:.decimals$}",
-                self.spell_symbol(),
-                self.condition.verb(from, level),
-                level
-            ),
+            title: match self.name.is_empty() {
+                true => what,
+                false => format!("{}: {what}", self.name),
+            },
             body: format!("now {price:.decimals$}{note}"),
         })
+    }
+
+    /// The note with its placeholders filled in.
+    pub fn message(&self, price: f64, decimals: usize) -> String {
+        self.note
+            .replace("{{ticker}}", &self.spell_symbol())
+            .replace("{{price}}", &format!("{price:.decimals$}"))
+            .replace("{{level}}", &self.spell_level(decimals))
     }
 
     /// Ready to fire again, measuring from the next price rather than the
@@ -171,23 +391,56 @@ impl Alert {
         self.last = None;
     }
 
-    /// One line: `#3 AAPL cross 195.00 (line #12) · armed · "breakout"`.
-    pub fn describe(&self, decimals: usize) -> String {
+    /// Stop checking it, keeping everything else.
+    pub fn pause(&mut self) {
+        self.paused = true;
+    }
+
+    /// Check it again. The price it last saw may be hours old, and a
+    /// crossing measured from it would fire on a move nobody watched.
+    pub fn resume(&mut self) {
+        self.paused = false;
+        self.last = None;
+    }
+
+    /// The same alert, ready to be given its own id: armed, with no log.
+    pub fn duplicate(&self, created: i64) -> Alert {
+        Alert { id: 0, created, fired: None, paused: false, log: Vec::new(), ..self.clone() }
+    }
+
+    /// The last time it fired, from the log or from before there was one.
+    pub fn last_fired(&self) -> Option<i64> {
+        self.log.last().map(|h| h.at).or(self.fired)
+    }
+
+    /// One line: `#3 [Breakout] AAPL cross 195.00 (line #12) · every time · armed · "go"`.
+    pub fn describe(&self, decimals: usize, now: i64) -> String {
+        let name = match self.name.is_empty() {
+            true => String::new(),
+            false => format!(" [{}]", self.name),
+        };
         let line = self.drawing.map(|id| format!(" (line #{id})")).unwrap_or_default();
-        let state = match self.fired {
-            None => "armed".to_string(),
-            Some(_) => "fired".to_string(),
+        let frequency = match self.frequency {
+            Frequency::Once => "",
+            Frequency::Every => " · every time",
+        };
+        let expires = match (self.expires, self.state(now)) {
+            (Some(at), State::Armed | State::Paused) => chrono::DateTime::from_timestamp(at, 0)
+                .map(|t| format!(" · until {}", t.format("%Y-%m-%d %H:%M UTC")))
+                .unwrap_or_default(),
+            _ => String::new(),
         };
         let note = match self.note.is_empty() {
             true => String::new(),
             false => format!(" · {:?}", self.note),
         };
         format!(
-            "#{} {} {} {:.decimals$}{line} · {state}{note}",
+            "#{}{name} {} {} {}{line}{frequency} · {}{expires}{note}",
             self.id,
             self.spell_symbol(),
             self.condition.key(),
-            self.level
+            self.spell_level(decimals),
+            self.state(now).key(),
         )
     }
 }
@@ -223,6 +476,7 @@ mod tests {
         assert_eq!(fired.title, "AAPL rose to 100.00");
         assert_eq!(fired.body, "now 100.50");
         assert_eq!(up.fired, Some(2));
+        assert_eq!(up.log, vec![Hit { at: 2, price: 100.5 }]);
         let mut down = alert(Condition::Below, 100.0);
         assert!(down.check(99.0, 1, 2).is_some(), "already below fires straight away");
     }
@@ -249,24 +503,112 @@ mod tests {
     }
 
     #[test]
-    fn a_note_and_a_suffix_reach_the_notification() {
+    fn a_crossing_one_way_ignores_the_other() {
+        let mut up = alert(Condition::CrossUp, 100.0);
+        up.check(101.0, 1, 2);
+        assert!(up.check(99.0, 2, 2).is_none(), "down is not up");
+        assert!(up.check(100.5, 3, 2).is_some());
+        let mut down = alert(Condition::CrossDown, 100.0);
+        down.check(99.0, 1, 2);
+        assert!(down.check(101.0, 2, 2).is_none());
+        assert_eq!(down.check(98.0, 3, 2).map(|f| f.title), Some("AAPL fell through 100.00".into()));
+    }
+
+    #[test]
+    fn a_channel_fires_on_the_way_in_or_out() {
+        let mut enter = alert(Condition::Enter, 200.0);
+        enter.upper = Some(190.0);
+        assert_eq!(enter.bounds(), (190.0, 200.0));
+        enter.check(205.0, 1, 2);
+        let fired = enter.check(195.0, 2, 2).expect("into it");
+        assert_eq!(fired.title, "AAPL entered 190.00–200.00");
+        let mut exit = alert(Condition::Exit, 190.0);
+        exit.upper = Some(200.0);
+        exit.check(195.0, 1, 2);
+        assert!(exit.check(199.0, 2, 2).is_none());
+        assert!(exit.check(189.0, 3, 2).is_some());
+    }
+
+    #[test]
+    fn every_time_stays_armed_and_fires_on_each_arrival() {
+        let mut every = alert(Condition::Above, 100.0);
+        every.frequency = Frequency::Every;
+        assert!(every.check(101.0, 1, 2).is_some(), "first price already there");
+        assert!(every.check(102.0, 2, 2).is_none(), "still there is not again");
+        assert!(every.check(99.0, 3, 2).is_none());
+        assert!(every.check(100.0, 4, 2).is_some(), "back again");
+        assert!(every.fired.is_none() && every.is_armed_at(5));
+        assert_eq!(every.log.len(), 2);
+        let mut cross = alert(Condition::Cross, 100.0);
+        cross.frequency = Frequency::Every;
+        cross.check(99.0, 1, 2);
+        assert!(cross.check(101.0, 2, 2).is_some());
+        assert!(cross.check(99.0, 3, 2).is_some());
+    }
+
+    #[test]
+    fn paused_and_expired_alerts_stay_quiet() {
+        let mut a = alert(Condition::Above, 100.0);
+        a.pause();
+        assert_eq!(a.state(0), State::Paused);
+        assert!(a.check(101.0, 1, 2).is_none());
+        a.resume();
+        a.expires = Some(10);
+        assert_eq!(a.state(9), State::Armed);
+        assert_eq!(a.state(10), State::Expired);
+        assert!(a.check(101.0, 11, 2).is_none());
+        assert!(a.check(101.0, 9, 2).is_some());
+    }
+
+    #[test]
+    fn a_name_a_note_and_a_suffix_reach_the_notification() {
         let mut a = Alert::new("NESN", Some("SW"), Condition::Above, 80.0, 0);
-        a.note = "trim".into();
+        a.note = "trim {{ticker}} at {{price}} (set {{level}})".into();
+        a.name = "Swiss".into();
         let fired = a.check(81.0, 1, 2).unwrap();
-        assert_eq!(fired.title, "NESN.SW rose to 80.00");
-        assert_eq!(fired.body, "now 81.00 · trim");
+        assert_eq!(fired.title, "Swiss: NESN.SW rose to 80.00");
+        assert_eq!(fired.body, "now 81.00 · trim NESN.SW at 81.00 (set 80.00)");
         assert!(a.is_for("NESN", Some("SW")) && !a.is_for("NESN", None));
     }
 
     #[test]
-    fn the_list_survives_the_store() {
+    fn the_log_keeps_the_newest() {
         let mut a = alert(Condition::Cross, 100.0);
+        a.frequency = Frequency::Every;
+        for n in 0..(LOG_LIMIT as i64 * 2 + 2) {
+            a.check(if n % 2 == 0 { 99.0 } else { 101.0 }, n, 2);
+        }
+        assert_eq!(a.log.len(), LOG_LIMIT);
+        assert_eq!(a.log.last().unwrap().at, LOG_LIMIT as i64 * 2 + 1);
+    }
+
+    #[test]
+    fn the_list_survives_the_store_and_reads_the_old_one() {
+        let mut a = alert(Condition::CrossUp, 100.0);
         a.id = 3;
         a.drawing = Some(12);
+        a.frequency = Frequency::Every;
+        a.expires = Some(99);
+        a.log.push(Hit { at: 1, price: 2.0 });
         let list = vec![a];
         assert_eq!(from_json(Some(&to_json(&list))), list);
         assert_eq!(from_json(Some("not json")), Vec::<Alert>::new());
+        let old = r#"[{"id":1,"symbol":"AAPL","condition":"above","level":250.0,"created":5,"fired":7}]"#;
+        let read = from_json(Some(old));
+        assert_eq!(read[0].frequency, Frequency::Once);
+        assert_eq!(read[0].state(10), State::Fired);
         assert_eq!(next_id(&list), 4);
         assert_eq!(next_id(&[]), 1);
+    }
+
+    #[test]
+    fn a_duplicate_starts_fresh() {
+        let mut a = alert(Condition::Above, 100.0);
+        a.id = 4;
+        a.check(101.0, 1, 2);
+        a.pause();
+        let b = a.duplicate(9);
+        assert_eq!((b.id, b.created, b.fired, b.paused, b.log.len()), (0, 9, None, false, 0));
+        assert_eq!(b.level, 100.0);
     }
 }

@@ -2834,6 +2834,18 @@ impl ChartView {
         self.state.borrow().configs.clone()
     }
 
+    /// The price at a point on the chart, for "alert at this price". `None`
+    /// off the price plot or with no bars to measure against.
+    pub fn price_at_point(&self, x: f64, y: f64) -> Option<f64> {
+        let state = self.state.borrow();
+        let (w, h) = (self.area.width() as f64, self.area.height() as f64);
+        let plan = layout(&state, w, h);
+        if !(plan.price_y..=plan.price_y + plan.price_h).contains(&y) {
+            return None;
+        }
+        state.locate(w, h, x, y).map(|anchor| anchor.price).filter(|p| p.is_finite() && *p > 0.0)
+    }
+
     /// The levels of the armed alerts on this chart's symbol.
     pub fn set_alert_levels(&self, levels: Vec<f64>) {
         let mut state = self.state.borrow_mut();
