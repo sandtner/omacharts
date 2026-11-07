@@ -39,6 +39,8 @@ pub struct Request {
     pub commission: String,
     /// In percent.
     pub slippage: String,
+    /// The saved strategy the rules came from, while they still say what it does.
+    pub strategy: Option<i64>,
 }
 
 impl Default for Request {
@@ -56,6 +58,7 @@ impl Default for Request {
             risk: String::new(),
             commission: "0".into(),
             slippage: "0.05".into(),
+            strategy: None,
         }
     }
 }

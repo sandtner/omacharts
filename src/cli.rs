@@ -286,6 +286,9 @@ pub trait Live {
     /// Queue batches of closes on the window's loader, the same bargain as
     /// [`Self::warm`] for the rows a batch can cover.
     fn warm_closes(&self, batches: Vec<Vec<Listing>>);
+    /// The saved strategies changed: the dock's list of them follows.
+    fn adopt_strategies(&self) {}
+
     /// Open the backtest dock on the focused chart with this strategy.
     fn show_backtest(&self, _request: &crate::backtests::Request) -> Result<(), Fault> {
         Err(Fault::no_window("focused chart"))
@@ -1103,6 +1106,10 @@ impl Live for Rc<crate::ui::Window> {
     fn show_backtest(&self, request: &crate::backtests::Request) -> Result<(), Fault> {
         crate::ui::Window::open_backtest(self, request);
         Ok(())
+    }
+
+    fn adopt_strategies(&self) {
+        crate::ui::Window::adopt_strategies(self);
     }
 
     fn symbols(&self) -> Option<Rc<SearchIndex>> {

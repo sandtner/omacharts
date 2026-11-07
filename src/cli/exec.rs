@@ -199,6 +199,21 @@ pub fn dispatch(
         }
 
         ("strategy", "backtest") => strategy_backtest(store, m, json, live),
+        ("strategy", "list") => strategy_list(store, json),
+        ("strategy", _) => {
+            let outcome = match verb {
+                "add" => strategy_add(store, m, json),
+                "edit" => strategy_edit(store, m, json),
+                "remove" => strategy_remove(store, m, json),
+                _ => Err(Fault::usage(format!("no such command: strategy {verb}"))),
+            };
+            if outcome.is_ok()
+                && let Some(live) = live
+            {
+                live.adopt_strategies();
+            }
+            outcome
+        }
         ("provider", "list") => provider_list(store, json),
         ("provider", "status") => provider_status(store, live, json),
         ("provider", "login") => provider_login(store, m, json),
@@ -4705,28 +4720,146 @@ fn day_start(flag: &str, text: &str) -> Result<i64, Fault> {
         .ok_or_else(|| Fault::usage(format!("--{flag} is a day such as 2020-01-01, not {text:?}")))
 }
 
+fn strategy_json(saved: &omacharts_engine::strategy::Saved) -> Value {
+    let mut value = serde_json::to_value(saved).unwrap_or_else(|_| json!({}));
+    value["timeframe"] = json!(saved.resolution().key());
+    value["valid"] = json!(saved.strategy().is_ok());
+    value
+}
+
+fn strategy_list(store: &Store, as_json: bool) -> Result<String, Fault> {
+    let list = store.strategies();
+    if as_json {
+        return Ok(format!("{}\n", json!({"strategies": list.iter().map(strategy_json).collect::<Vec<_>>()})));
+    }
+    if list.is_empty() {
+        return Ok("no saved strategies; `strategy add NAME --entry …` saves one\n".into());
+    }
+    Ok(list.iter().map(|s| s.describe()).collect::<Vec<_>>().join("\n") + "\n")
+}
+
+/// The flags that change a strategy's parts, onto it. `none` clears a part
+/// that may be empty.
+fn strategy_parts_onto(m: &clap::ArgMatches, saved: &mut omacharts_engine::strategy::Saved) -> Result<(), Fault> {
+    let cleared = |text: &String| match text.trim().eq_ignore_ascii_case("none") {
+        true => String::new(),
+        false => text.clone(),
+    };
+    if let Some(text) = arg(m, "entry") {
+        saved.entry = text.clone();
+    }
+    for (flag, part) in [("exit", &mut saved.exit), ("stop", &mut saved.stop), ("target", &mut saved.target)] {
+        if let Some(text) = arg(m, flag) {
+            *part = cleared(text);
+        }
+    }
+    if let Some(timeframe) = alert_timeframe(m)? {
+        saved.timeframe = Some(timeframe);
+    }
+    if let Some(note) = arg(m, "note") {
+        saved.note = note.trim().to_string();
+    }
+    Ok(())
+}
+
+fn strategy_add(store: &Store, m: &clap::ArgMatches, as_json: bool) -> Result<String, Fault> {
+    use omacharts_engine::strategy::{next_id, taken, Saved};
+    let mut list = store.strategies();
+    let name = required(m, "NAME")?;
+    let mut saved = Saved {
+        id: next_id(&list),
+        name: name.clone(),
+        entry: String::new(),
+        exit: String::new(),
+        stop: String::new(),
+        target: String::new(),
+        timeframe: None,
+        note: String::new(),
+        created: alert_now(),
+    };
+    strategy_parts_onto(m, &mut saved)?;
+    let saved = saved.normalised().map_err(Fault::usage)?;
+    if taken(&list, &saved.name, None) {
+        return Err(Fault::refused(format!("there is already a strategy called {:?}; `strategy edit` changes it", saved.name)));
+    }
+    let text = format!("saved {}", saved.describe());
+    let value = strategy_json(&saved);
+    list.push(saved);
+    store.set_strategies(&list);
+    said(as_json, json!({"strategy": value, "message": text}), text)
+}
+
+/// The saved strategy `STRATEGY` names, as an index into the list.
+fn strategy_at(list: &[omacharts_engine::strategy::Saved], m: &clap::ArgMatches) -> Result<usize, Fault> {
+    let text = required(m, "STRATEGY")?;
+    let found = omacharts_engine::strategy::find(list, text)
+        .ok_or_else(|| Fault::not_found(format!("no saved strategy {text:?}; see `strategy list`")))?;
+    Ok(list.iter().position(|s| s.id == found.id).unwrap_or_default())
+}
+
+fn strategy_edit(store: &Store, m: &clap::ArgMatches, as_json: bool) -> Result<String, Fault> {
+    let mut list = store.strategies();
+    let at = strategy_at(&list, m)?;
+    let mut saved = list[at].clone();
+    strategy_parts_onto(m, &mut saved)?;
+    if let Some(name) = arg(m, "name") {
+        saved.name = name.clone();
+    }
+    let saved = saved.normalised().map_err(Fault::usage)?;
+    if omacharts_engine::strategy::taken(&list, &saved.name, Some(saved.id)) {
+        return Err(Fault::refused(format!("there is already a strategy called {:?}", saved.name)));
+    }
+    let text = format!("changed {}", saved.describe());
+    let value = strategy_json(&saved);
+    list[at] = saved;
+    store.set_strategies(&list);
+    said(as_json, json!({"strategy": value, "message": text}), text)
+}
+
+fn strategy_remove(store: &Store, m: &clap::ArgMatches, as_json: bool) -> Result<String, Fault> {
+    let mut list = store.strategies();
+    let at = strategy_at(&list, m)?;
+    let gone = list.remove(at);
+    store.set_strategies(&list);
+    let text = format!("removed {}", gone.describe());
+    said(as_json, json!({"removed": gone.id, "message": text}), text)
+}
+
 /// Run a strategy over a symbol's history, and say how it did.
 fn strategy_backtest(store: &Store, m: &clap::ArgMatches, as_json: bool, live: Option<&dyn Live>) -> Result<String, Fault> {
-    use omacharts_engine::backtest::{self, Reason, Settings, Stop, Strategy, Target};
-    use omacharts_engine::condition::{Inputs, Rule};
+    use omacharts_engine::backtest::{self, Reason, Settings, Stop, Target};
+    use omacharts_engine::condition::Inputs;
     use omacharts_engine::position::Stake;
-    let rule = |flag: &str| -> Result<Option<Rule>, Fault> {
-        arg(m, flag).map(|t| Rule::parse(t).map_err(|e| Fault::usage(format!("--{flag}: {e}")))).transpose()
+    // A saved strategy, if one is named, with whatever flags are given
+    // laid over it for this run.
+    let saved = match arg(m, "strategy") {
+        None => None,
+        Some(text) => Some(
+            omacharts_engine::strategy::find(&store.strategies(), text)
+                .cloned()
+                .ok_or_else(|| Fault::not_found(format!("no saved strategy {text:?}; see `strategy list`")))?,
+        ),
     };
-    let entry = rule("entry")?.ok_or_else(|| Fault::usage("give --entry, the rule to buy on".into()))?;
-    let strategy = Strategy {
-        entry,
-        exit: rule("exit")?,
-        stop: arg(m, "stop").map(|t| Stop::parse(t).map_err(Fault::usage)).transpose()?,
-        target: arg(m, "target").map(|t| Target::parse(t).map_err(Fault::usage)).transpose()?,
+    let part = |flag: &str, kept: Option<&String>| -> String {
+        match arg(m, flag) {
+            Some(text) if text.eq_ignore_ascii_case("none") => String::new(),
+            Some(text) => text.clone(),
+            None => kept.cloned().unwrap_or_default(),
+        }
     };
-    if strategy.exit.is_none() && strategy.stop.is_none() && strategy.target.is_none() {
-        return Err(Fault::usage("a trade needs a way out: give --exit, --stop or --target".into()));
+    let (entry, exit, stop, target) = (
+        part("entry", saved.as_ref().map(|s| &s.entry)),
+        part("exit", saved.as_ref().map(|s| &s.exit)),
+        part("stop", saved.as_ref().map(|s| &s.stop)),
+        part("target", saved.as_ref().map(|s| &s.target)),
+    );
+    if entry.trim().is_empty() {
+        return Err(Fault::usage("give --entry, the rule to buy on, or --strategy, a saved one".into()));
     }
-    if matches!(strategy.target, Some(Target::R(_))) && strategy.stop.is_none() {
-        return Err(Fault::usage("a target in R is a multiple of the risk, which needs --stop".into()));
-    }
-    let timeframe = alert_timeframe(m)?.unwrap_or(Timeframe::days(1));
+    let strategy = omacharts_engine::strategy::parts(&entry, &exit, &stop, &target).map_err(Fault::usage)?;
+    let timeframe = alert_timeframe(m)?
+        .or(saved.as_ref().map(omacharts_engine::strategy::Saved::resolution))
+        .unwrap_or(Timeframe::days(1));
     let mut risk = store.position_risk();
     if let Some(account) = number(m, "account")? {
         if !account.is_finite() || account <= 0.0 {
@@ -4768,10 +4901,11 @@ fn strategy_backtest(store: &Store, m: &clap::ArgMatches, as_json: bool, live: O
         let Some(live) = live else { return Err(Fault::no_window("focused chart")) };
         let text = |flag: &str| arg(m, flag).cloned().unwrap_or_default();
         let request = crate::backtests::Request {
-            entry: text("entry"),
-            exit: text("exit"),
-            stop: text("stop"),
-            target: text("target"),
+            entry: entry.clone(),
+            exit: exit.clone(),
+            stop: stop.clone(),
+            target: target.clone(),
+            strategy: saved.as_ref().map(|s| s.id),
             period: match (last, from.is_some() || to.is_some()) {
                 (Some(length), _) => length.clone(),
                 (None, true) => "custom".into(),
@@ -4862,6 +4996,9 @@ fn strategy_backtest(store: &Store, m: &clap::ArgMatches, as_json: bool, live: O
     };
     let describe = {
         let mut words = vec![format!("long when {}", strategy.entry)];
+        if let Some(saved) = &saved {
+            words[0] = format!("{:?}: {}", saved.name, words[0]);
+        }
         if let Some(exit) = &strategy.exit {
             words.push(format!("out when {exit}"));
         }
@@ -8105,6 +8242,71 @@ mod tests {
         assert_eq!(marks.len(), 1, "{marks:?}");
         assert_eq!(marks[0].label, "#2");
         assert_eq!(marks[0].ts, bars[crossed[0]].ts + 86_399);
+    }
+
+    /// A strategy is saved by name, listed, changed, run by name with a
+    /// flag laid over it for one run, and removed.
+    #[test]
+    fn strategies_are_saved_changed_run_and_removed() {
+        use omacharts_engine::Bar;
+        let store = bare();
+        let words = |line: &[&str]| -> Outcome {
+            let args: Vec<String> =
+                std::iter::once("omacharts").chain(line.iter().copied()).map(String::from).collect();
+            dispatch(&args, &store, None, &super::super::Here)
+        };
+        assert!(words(&["strategy", "list"]).out.contains("no saved strategies"));
+        let out = words(&[
+            "strategy", "add", "Trend", "--entry", "sma(5) crosses above sma(20)", "--exit", "sma(5) crosses_below sma(20)",
+            "--stop", "2 atr", "--note", "the classic",
+        ]);
+        assert_eq!(out.code, 0, "{}", out.err);
+        assert_eq!(
+            out.out.trim(),
+            "saved #1 Trend · buy when sma(5) crosses_above sma(20) · sell when sma(5) crosses_below sma(20) · stop 2*atr(14) · 1D · \"the classic\""
+        );
+        assert_eq!(words(&["strategy", "add", "trend", "--entry", "close > 1", "--stop", "3%"]).code, super::super::EXIT_REFUSED);
+        assert_eq!(words(&["strategy", "add", "Bad", "--entry", "close >", "--stop", "3%"]).code, EXIT_USAGE);
+        assert_eq!(words(&["strategy", "add", "No exit", "--entry", "close > 1"]).code, EXIT_USAGE);
+        assert_eq!(words(&["strategy", "add", "42", "--entry", "close > 1", "--stop", "3%"]).code, EXIT_USAGE);
+
+        let out = words(&["strategy", "edit", "TREND", "--target", "3R", "--timeframe", "4h", "--name", "Trend 3R"]);
+        assert_eq!(out.code, 0, "{}", out.err);
+        assert!(out.out.contains("#1 Trend 3R ·") && out.out.contains("target 3R · 4h"), "{}", out.out);
+        let out = words(&["strategy", "edit", "#1", "--target", "none", "--timeframe", "1D"]);
+        assert!(!out.out.contains("target"), "{}", out.out);
+        assert_eq!(words(&["strategy", "edit", "#1", "--stop", "none", "--exit", "none"]).code, EXIT_USAGE, "no way out left");
+        assert_eq!(words(&["strategy", "edit", "nothing", "--stop", "3%"]).code, super::super::EXIT_NOT_FOUND);
+        let value: Value = serde_json::from_str(&words(&["strategy", "list", "--json"]).out).unwrap();
+        assert_eq!(value["strategies"][0]["name"], json!("Trend 3R"));
+        assert_eq!(value["strategies"][0]["timeframe"], json!("1D"));
+        assert_eq!(value["strategies"][0]["valid"], json!(true));
+
+        // Run by name, over bars that dip and recover.
+        let index = crate::inventory::everything();
+        let instrument = index.find("AAPL", None).unwrap().clone();
+        let provider = crate::feeds::selected(&store);
+        let key = super::super::cache_key(provider.as_ref(), &instrument).unwrap();
+        let start = 1_700_000_000 / 86_400 * 86_400;
+        let bars: Vec<Bar> = (0..60)
+            .map(|i| {
+                let c = if i < 30 { 200.0 - i as f64 } else { 170.0 + (i - 30) as f64 * 3.0 };
+                Bar { ts: start + i * 86_400, open: c, high: c + 1.0, low: c - 1.0, close: c, volume: 1e6 }
+            })
+            .collect();
+        store.write_bars(&key, Timeframe::days(1), &bars);
+        let out = words(&["strategy", "backtest", "AAPL", "--strategy", "trend 3r"]);
+        assert_eq!(out.code, 0, "{}", out.err);
+        assert!(out.out.starts_with("AAPL 1D · \"Trend 3R\": long when sma(5) crosses_above sma(20)"), "{}", out.out);
+        let out = words(&["strategy", "backtest", "AAPL", "--strategy", "1", "--stop", "3%", "--target", "5%", "--json"]);
+        let value: Value = serde_json::from_str(&out.out).unwrap();
+        assert_eq!(value["stop"], json!("3%"), "the flag wins for this run");
+        assert_eq!(value["trades"][0]["reason"], json!("target"));
+        assert!(words(&["strategy", "list"]).out.contains("stop 2*atr(14)"), "and the saved one is unchanged");
+        assert_eq!(words(&["strategy", "backtest", "AAPL", "--strategy", "nope"]).code, super::super::EXIT_NOT_FOUND);
+
+        assert!(words(&["strategy", "remove", "Trend 3R"]).out.starts_with("removed #1"));
+        assert!(words(&["strategy", "list"]).out.contains("no saved strategies"));
     }
 
     /// A strategy is run over the cached bars, refuses what cannot be a

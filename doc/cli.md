@@ -1030,6 +1030,28 @@ omacharts strategy backtest NVDA --timeframe 1h --entry "rsi(14) crosses_above 3
 omacharts strategy backtest QQQ --entry "close > ema(200)" --exit "close < ema(200)" --json   # every trade and the equity curve
 ```
 
+### Saved strategies
+
+A strategy can be kept under a name, to run again on another symbol, another
+resolution or another day:
+
+```sh
+omacharts strategy add "Trend follower" --entry "close > ema(50) and ema(50) > sma(200) and macd crosses_above macd.signal" \
+    --exit "close crosses_below ema(50)" --stop "2*atr(14)" --target 3R --note "only in an uptrend"
+omacharts strategy list                      # every saved strategy, with its number
+omacharts strategy edit "Trend follower" --target none --timeframe 4h   # none clears an exit, stop or target
+omacharts strategy edit 1 --name "Trend 4h"
+omacharts strategy backtest QQQ --strategy "Trend 4h"                 # run it on another symbol
+omacharts strategy backtest QQQ --strategy 1 --stop 3% --last 1y      # a flag changes it for this run only
+omacharts strategy remove "Trend 4h"
+```
+
+A strategy is found by its name in any case, or by its number. Its rules are
+kept as the rule reader spells them, so two ways of writing one rule are
+saved as one. Its resolution, 1D unless `--timeframe` says otherwise, is what
+`strategy backtest` uses when no `--timeframe` is given. In the dock, the
+chart's own resolution is used.
+
 ### The backtest dock
 
 In the window, Ctrl+Shift+B opens the backtest dock under the charts. The
@@ -1040,6 +1062,11 @@ the resolution or the bars move. The form is kept between sessions.
 `omacharts strategy backtest --entry … --show` opens it from a terminal
 with that strategy.
 
+- **The header, saved strategies:** pick one to fill the rules (the period
+  and the money stay as they are). "edited" shows once the rules no longer
+  match it, and Save writes them back. With no strategy picked, Save asks
+  for a name. The ⋮ menu has Save as new…, Rename… and Delete. A new
+  strategy keeps the chart's resolution.
 - **Left, the form:** buy and sell rules, stop, target, account, risk,
   commission and slippage. A field that cannot be read is marked, with what
   is wrong under the form. The period is picked in the dock's header: 1, 3

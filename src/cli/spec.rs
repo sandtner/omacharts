@@ -364,6 +364,24 @@ const ALERT_EDIT_FLAGS: &[Flag] = alert_flags![
     Flag::valued("symbol", "SYMBOL", "move it to another instrument; not for an alert on a line"),
 ];
 
+/// The parts of a strategy, for `strategy add` and `strategy edit`.
+macro_rules! strategy_parts {
+    ($($own:expr),* $(,)?) => {
+        &[
+            Flag::valued("entry", "RULE", "buy at the next open when this starts to hold; the rule language of `alert test`"),
+            Flag::valued("exit", "RULE", "sell at the next open when this holds"),
+            Flag::valued("stop", "STOP", "a stop below the fill: 2*atr(14) or 3%"),
+            Flag::valued("target", "TARGET", "take profit: 2R or 8%"),
+            Flag::valued("timeframe", "TF", "the resolution it is written for, which a command runs it on when none is named (default: 1D)"),
+            Flag::valued("note", "WORDS", "what it is for"),
+            $($own,)*
+        ]
+    };
+}
+
+const STRATEGY_PARTS: &[Flag] = strategy_parts![];
+const STRATEGY_EDIT_FLAGS: &[Flag] = strategy_parts![Flag::valued("name", "NAME", "call it something else")];
+
 pub const SURFACE: &[Noun] = &[
     Noun {
         name: "status",
@@ -1075,33 +1093,76 @@ pub const SURFACE: &[Noun] = &[
     },
     Noun {
         name: "strategy",
-        about: "Strategies written as rules over the bars: backtest one over a symbol's history",
+        about: "Strategies written as rules over the bars: save them by name, and backtest one over a symbol's history",
         local: false,
-        verbs: &[Verb {
-            name: "backtest",
-            about: "What a strategy would have done over a symbol's cached history: long only, deciding on closed bars and filling at the next open, sized like the position tool",
-            args: &[Arg::opt("SYMBOL", "the instrument (default: the focused chart's)")],
-            flags: &[
-                Flag::valued("entry", "RULE", "buy at the next open when this starts to hold, such as \"sma(20) crosses_above sma(50)\"; the rule language of `alert test`"),
-                Flag::valued("exit", "RULE", "sell at the next open when this holds"),
-                Flag::valued("stop", "STOP", "a stop below the fill: a multiple of the ATR such as 2*atr(14), or a percentage such as 3%; with one, trades are sized by risk"),
-                Flag::valued("target", "TARGET", "take profit: a multiple of the risk such as 2R, or a percentage such as 8%"),
-                Flag::valued("timeframe", "TF", "the bars to trade on (default: 1D)"),
-                Flag::valued("last", "LENGTH", "trade only over the last 90d, 6w, 2mo or 1y before the last closed bar"),
-                Flag::valued("from", "DATE", "trade only from this day, such as 2020-01-01 (default: as far back as is cached)"),
-                Flag::valued("to", "DATE", "trade only until this day"),
-                Flag::valued("account", "AMOUNT", "what the account starts with (default: `config risk`'s)"),
-                Flag::valued("risk", "STAKE", "what one trade may lose with a stop: 1% of the account, or an amount (default: `config risk`'s)"),
-                Flag::valued("commission", "AMOUNT", "paid on every fill, in the account's currency (default: 0)"),
-                Flag::valued("slippage", "PERCENT", "lost on every fill, in percent of the price (default: 0.05)"),
-                Flag::valued("trades", "N", "how many of the latest trades to list (default: 10; 0 for none)"),
-                Flag::switch("show", "also open the backtest dock on the focused chart with this strategy, its trades laid over the bars; needs the window, and uses the chart's symbol and resolution"),
-            ],
-            example: "omacharts strategy backtest SPY --entry \"sma(20)>sma(50)\" --exit \"sma(20)<sma(50)\" --stop 2*atr(14)",
-            json: true,
-            writes: false,
-            workspace: false,
-        }],
+        verbs: &[
+            Verb {
+                name: "list",
+                about: "Every saved strategy",
+                args: &[],
+                flags: &[],
+                example: "omacharts strategy list --json",
+                json: true,
+                writes: false,
+                workspace: false,
+            },
+            Verb {
+                name: "add",
+                about: "Save a strategy under a name: an entry rule, and an exit rule, a stop or a target",
+                args: &[Arg::req("NAME", "what it is called, such as \"Trend SPY\"")],
+                flags: STRATEGY_PARTS,
+                example: "omacharts strategy add Trend --entry \"sma(20)>sma(50)\" --exit \"sma(20)<sma(50)\" --stop 2*atr(14)",
+                json: true,
+                writes: true,
+                workspace: false,
+            },
+            Verb {
+                name: "edit",
+                about: "Change a saved strategy: its rules, stop, target, resolution, note or name; none clears an exit, stop or target",
+                args: &[Arg::req("STRATEGY", "its name or number, from `strategy list`")],
+                flags: STRATEGY_EDIT_FLAGS,
+                example: "omacharts strategy edit Trend --target 3R --name Trend3R",
+                json: true,
+                writes: true,
+                workspace: false,
+            },
+            Verb {
+                name: "remove",
+                about: "Delete a saved strategy",
+                args: &[Arg::req("STRATEGY", "its name or number, from `strategy list`")],
+                flags: &[],
+                example: "omacharts strategy remove Trend",
+                json: true,
+                writes: true,
+                workspace: false,
+            },
+            Verb {
+                name: "backtest",
+                about: "What a strategy would have done over a symbol's cached history: long only, deciding on closed bars and filling at the next open, sized like the position tool",
+                args: &[Arg::opt("SYMBOL", "the instrument (default: the focused chart's)")],
+                flags: &[
+                    Flag::valued("strategy", "STRATEGY", "a saved strategy, by name or number; the flags below change it for this run only"),
+                    Flag::valued("entry", "RULE", "buy at the next open when this starts to hold, such as \"sma(20) crosses_above sma(50)\"; the rule language of `alert test`"),
+                    Flag::valued("exit", "RULE", "sell at the next open when this holds"),
+                    Flag::valued("stop", "STOP", "a stop below the fill: a multiple of the ATR such as 2*atr(14), or a percentage such as 3%; with one, trades are sized by risk"),
+                    Flag::valued("target", "TARGET", "take profit: a multiple of the risk such as 2R, or a percentage such as 8%"),
+                    Flag::valued("timeframe", "TF", "the bars to trade on (default: the saved strategy's, or 1D)"),
+                    Flag::valued("last", "LENGTH", "trade only over the last 90d, 6w, 2mo or 1y before the last closed bar"),
+                    Flag::valued("from", "DATE", "trade only from this day, such as 2020-01-01 (default: as far back as is cached)"),
+                    Flag::valued("to", "DATE", "trade only until this day"),
+                    Flag::valued("account", "AMOUNT", "what the account starts with (default: `config risk`'s)"),
+                    Flag::valued("risk", "STAKE", "what one trade may lose with a stop: 1% of the account, or an amount (default: `config risk`'s)"),
+                    Flag::valued("commission", "AMOUNT", "paid on every fill, in the account's currency (default: 0)"),
+                    Flag::valued("slippage", "PERCENT", "lost on every fill, in percent of the price (default: 0.05)"),
+                    Flag::valued("trades", "N", "how many of the latest trades to list (default: 10; 0 for none)"),
+                    Flag::switch("show", "also open the backtest dock on the focused chart with this strategy, its trades laid over the bars; needs the window, and uses the chart's symbol and resolution"),
+                ],
+                example: "omacharts strategy backtest SPY --entry \"sma(20)>sma(50)\" --exit \"sma(20)<sma(50)\" --stop 2*atr(14)",
+                json: true,
+                writes: false,
+                workspace: false,
+            },
+        ],
     },
     Noun {
         name: "provider",

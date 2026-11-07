@@ -8284,6 +8284,13 @@ impl Window {
         }
     }
 
+    /// The saved strategies changed somewhere: the dock's list follows.
+    pub fn adopt_strategies(&self) {
+        if let Some(dock) = self.backtest.borrow().clone() {
+            dock.reload_strategies();
+        }
+    }
+
     /// Run the open dock again: the focus, the symbol, the resolution or
     /// the bars under it moved.
     fn backtest_follow(&self) {

@@ -72,6 +72,7 @@ const SHARED: &[&str] = &[
     "chart_time_zone",
     "time_format",
     "backtest_request",
+    "strategies",
 ];
 
 pub fn kind(key: &str) -> Kind {

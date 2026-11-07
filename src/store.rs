@@ -1108,6 +1108,14 @@ impl Store {
         self.set_setting(omacharts_engine::alert::SETTING, &omacharts_engine::alert::to_json(alerts));
     }
 
+    pub fn strategies(&self) -> Vec<omacharts_engine::strategy::Saved> {
+        omacharts_engine::strategy::from_json(self.setting(omacharts_engine::strategy::SETTING).as_deref())
+    }
+
+    pub fn set_strategies(&self, list: &[omacharts_engine::strategy::Saved]) {
+        self.set_setting(omacharts_engine::strategy::SETTING, &omacharts_engine::strategy::to_json(list));
+    }
+
     /// Write a drawing down for the first time. Hands back its id, which the
     /// caller keeps on the drawing so later writes find the same row.
     pub fn add_drawing(&self, symbol: &str, suffix: Option<&str>, drawing: &Drawing) -> Option<i64> {

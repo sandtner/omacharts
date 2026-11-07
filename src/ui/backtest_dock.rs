@@ -79,6 +79,22 @@ pub struct Dock {
     /// Set while the form is being filled from a stored request, so filling
     /// it does not count as somebody editing it.
     loading: Cell<bool>,
+    /// The saved strategies, as the header's list offers them: "Unsaved"
+    /// first, then each by name, their ids in the same order after it.
+    strategies: gtk::DropDown,
+    strategy_ids: RefCell<Vec<i64>>,
+    /// The saved strategy the form was filled from, while it is chosen.
+    chosen: Cell<Option<i64>>,
+    /// "edited": the form no longer says what the chosen strategy does.
+    edited_mark: gtk::Label,
+    save: gtk::Button,
+    /// The name asked for when saving as new or renaming.
+    naming: gtk::Popover,
+    name_entry: gtk::Entry,
+    name_problem: gtk::Label,
+    /// Whether the name popover renames the chosen strategy rather than
+    /// saving a new one.
+    renaming: Cell<bool>,
 }
 
 fn field(placeholder: &str, width: i32) -> gtk::Entry {
@@ -112,6 +128,50 @@ impl Dock {
         let title = gtk::Label::new(Some("Backtest"));
         title.add_css_class("heading");
         header.append(&title);
+        // The saved strategies: pick one to fill the form, save the form as
+        // one, and the rest from the menu beside it.
+        let strategies = gtk::DropDown::from_strings(&["Unsaved strategy"]);
+        strategies.set_tooltip_text(Some("A saved strategy fills the rules; the period and the money stay"));
+        header.append(&strategies);
+        let edited_mark = gtk::Label::new(Some("edited"));
+        edited_mark.add_css_class("dim-label");
+        edited_mark.add_css_class("caption");
+        edited_mark.set_visible(false);
+        header.append(&edited_mark);
+        let save = gtk::Button::with_label("Save");
+        save.set_tooltip_text(Some("Save the rules as the chosen strategy, or as a new one"));
+        header.append(&save);
+        let menu = gtk::gio::Menu::new();
+        menu.append(Some("Save as new…"), Some("dock.save-as"));
+        menu.append(Some("Rename…"), Some("dock.rename"));
+        menu.append(Some("Delete"), Some("dock.delete"));
+        let more = gtk::MenuButton::new();
+        more.set_icon_name("view-more-symbolic");
+        more.add_css_class("flat");
+        more.set_menu_model(Some(&menu));
+        more.set_tooltip_text(Some("More about saved strategies"));
+        header.append(&more);
+        let naming = gtk::Popover::new();
+        let name_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        name_box.set_margin_start(6);
+        name_box.set_margin_end(6);
+        name_box.set_margin_top(6);
+        name_box.set_margin_bottom(6);
+        let name_entry = gtk::Entry::new();
+        name_entry.set_placeholder_text(Some("Name, such as Trend SPY"));
+        name_entry.set_width_chars(24);
+        let name_problem = gtk::Label::new(None);
+        name_problem.add_css_class("error");
+        name_problem.add_css_class("caption");
+        name_problem.set_xalign(0.0);
+        name_problem.set_visible(false);
+        let name_ok = gtk::Button::with_label("Save");
+        name_ok.add_css_class("suggested-action");
+        name_box.append(&name_entry);
+        name_box.append(&name_problem);
+        name_box.append(&name_ok);
+        naming.set_child(Some(&name_box));
+        naming.set_parent(&save);
         let subject = gtk::Label::new(None);
         subject.add_css_class("dim-label");
         subject.set_ellipsize(gtk::pango::EllipsizeMode::End);
@@ -284,7 +344,65 @@ impl Dock {
             last: RefCell::new(None),
             generation: Cell::new(0),
             loading: Cell::new(false),
+            strategies,
+            strategy_ids: RefCell::new(Vec::new()),
+            chosen: Cell::new(None),
+            edited_mark,
+            save,
+            naming,
+            name_entry,
+            name_problem,
+            renaming: Cell::new(false),
         });
+        {
+            let weak = Rc::downgrade(&dock);
+            dock.strategies.connect_selected_notify(move |_| {
+                if let Some(dock) = weak.upgrade() {
+                    dock.strategy_picked();
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&dock);
+            dock.save.connect_clicked(move |_| {
+                if let Some(dock) = weak.upgrade() {
+                    dock.save_clicked();
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&dock);
+            name_ok.connect_clicked(move |_| {
+                if let Some(dock) = weak.upgrade() {
+                    dock.name_given();
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&dock);
+            dock.name_entry.connect_activate(move |_| {
+                if let Some(dock) = weak.upgrade() {
+                    dock.name_given();
+                }
+            });
+        }
+        let actions = gtk::gio::SimpleActionGroup::new();
+        for (name, run) in [
+            ("save-as", Dock::ask_name_new as fn(&Rc<Dock>)),
+            ("rename", Dock::ask_name_rename as fn(&Rc<Dock>)),
+            ("delete", Dock::delete_chosen as fn(&Rc<Dock>)),
+        ] {
+            let action = gtk::gio::SimpleAction::new(name, None);
+            let weak = Rc::downgrade(&dock);
+            action.connect_activate(move |_, _| {
+                if let Some(dock) = weak.upgrade() {
+                    run(&dock);
+                }
+            });
+            actions.add_action(&action);
+        }
+        dock.root.insert_action_group("dock", Some(&actions));
+        dock.reload_strategies();
 
         {
             let curve = dock.curve.clone();
@@ -377,7 +495,229 @@ impl Dock {
         let at = backtests::PERIODS.iter().position(|p| *p == request.period).unwrap_or(6);
         self.period.set_selected(at as u32);
         self.sync_period();
+        let known = request.strategy.filter(|id| self.strategy_ids.borrow().contains(id));
+        self.chosen.set(known);
+        self.select_chosen();
         self.loading.set(false);
+        self.sync_saved();
+    }
+
+    /// Fill the list of saved strategies from the store, keeping the one
+    /// chosen if it is still there.
+    pub fn reload_strategies(&self) {
+        let Some(window) = self.window.upgrade() else { return };
+        let list = window.store().strategies();
+        let mut names = vec!["Unsaved strategy".to_string()];
+        names.extend(list.iter().map(|s| s.name.clone()));
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let was = self.loading.replace(true);
+        self.strategies.set_model(Some(&gtk::StringList::new(&refs)));
+        *self.strategy_ids.borrow_mut() = list.iter().map(|s| s.id).collect();
+        if self.chosen.get().is_some_and(|id| !list.iter().any(|s| s.id == id)) {
+            self.chosen.set(None);
+        }
+        self.select_chosen();
+        self.loading.set(was);
+        self.sync_saved();
+    }
+
+    fn select_chosen(&self) {
+        let at = self
+            .chosen
+            .get()
+            .and_then(|id| self.strategy_ids.borrow().iter().position(|x| *x == id))
+            .map_or(0, |at| at + 1);
+        self.strategies.set_selected(at as u32);
+    }
+
+    /// The saved strategy chosen, as it is stored now.
+    fn chosen_saved(&self) -> Option<omacharts_engine::strategy::Saved> {
+        let window = self.window.upgrade()?;
+        let id = self.chosen.get()?;
+        window.store().strategies().into_iter().find(|s| s.id == id)
+    }
+
+    /// Whether the form's rules are the chosen strategy's, as the rule
+    /// reader spells both.
+    fn rules_match(&self, saved: &omacharts_engine::strategy::Saved) -> bool {
+        let spelled = |entry: &str, exit: &str, stop: &str, target: &str| {
+            omacharts_engine::strategy::parts(entry, exit, stop, target).ok().map(|s| {
+                (
+                    s.entry.to_string(),
+                    s.exit.map(|r| r.to_string()),
+                    s.stop.map(omacharts_engine::backtest::Stop::spell),
+                    s.target.map(omacharts_engine::backtest::Target::spell),
+                )
+            })
+        };
+        let form = spelled(&self.entry.text(), &self.exit.text(), &self.stop.text(), &self.target.text());
+        form.is_some() && form == spelled(&saved.entry, &saved.exit, &saved.stop, &saved.target)
+    }
+
+    /// The header says whether the form still is the chosen strategy.
+    fn sync_saved(&self) {
+        let saved = self.chosen_saved();
+        let edited = saved.as_ref().is_some_and(|s| !self.rules_match(s));
+        self.edited_mark.set_visible(edited);
+        self.save.set_label(if saved.is_some() { "Save" } else { "Save…" });
+        self.save.set_sensitive(saved.is_none() || edited);
+    }
+
+    /// A strategy picked in the header: its rules go into the form.
+    fn strategy_picked(self: &Rc<Self>) {
+        if self.loading.get() {
+            return;
+        }
+        let at = self.strategies.selected() as usize;
+        let id = at.checked_sub(1).and_then(|i| self.strategy_ids.borrow().get(i).copied());
+        self.chosen.set(id);
+        if let Some(saved) = self.chosen_saved() {
+            self.loading.set(true);
+            for (entry, text) in [
+                (&self.entry, &saved.entry),
+                (&self.exit, &saved.exit),
+                (&self.stop, &saved.stop),
+                (&self.target, &saved.target),
+            ] {
+                entry.set_text(text);
+            }
+            self.loading.set(false);
+        }
+        self.sync_saved();
+        self.schedule();
+    }
+
+    /// Save: over the chosen strategy, or as a new one under a name.
+    fn save_clicked(self: &Rc<Self>) {
+        match self.chosen_saved() {
+            Some(saved) => {
+                let mut changed = saved.clone();
+                changed.entry = self.entry.text().to_string();
+                changed.exit = self.exit.text().to_string();
+                changed.stop = self.stop.text().to_string();
+                changed.target = self.target.text().to_string();
+                if let Err(why) = self.store_strategy(changed, false) {
+                    self.problem.set_text(&why);
+                }
+            }
+            None => self.ask_name_new(),
+        }
+    }
+
+    fn ask_name_new(self: &Rc<Self>) {
+        self.renaming.set(false);
+        self.name_entry.set_text("");
+        self.name_problem.set_visible(false);
+        self.naming.popup();
+        self.name_entry.grab_focus();
+    }
+
+    fn ask_name_rename(self: &Rc<Self>) {
+        let Some(saved) = self.chosen_saved() else {
+            self.problem.set_text("Choose a saved strategy to rename");
+            return;
+        };
+        self.renaming.set(true);
+        self.name_entry.set_text(&saved.name);
+        self.name_problem.set_visible(false);
+        self.naming.popup();
+        self.name_entry.grab_focus();
+    }
+
+    /// The name popover's Save: a new strategy from the form, or the chosen
+    /// one renamed.
+    fn name_given(self: &Rc<Self>) {
+        let Some(window) = self.window.upgrade() else { return };
+        let name = self.name_entry.text().to_string();
+        let saved = match self.renaming.get() {
+            true => match self.chosen_saved() {
+                Some(mut saved) => {
+                    saved.name = name;
+                    saved
+                }
+                None => return,
+            },
+            false => {
+                let list = window.store().strategies();
+                omacharts_engine::strategy::Saved {
+                    id: omacharts_engine::strategy::next_id(&list),
+                    name,
+                    entry: self.entry.text().to_string(),
+                    exit: self.exit.text().to_string(),
+                    stop: self.stop.text().to_string(),
+                    target: self.target.text().to_string(),
+                    timeframe: Some(window.focused_pane().timeframe.get()),
+                    note: String::new(),
+                    created: chrono::Utc::now().timestamp(),
+                }
+            }
+        };
+        if let Err(why) = self.store_strategy(saved, true) {
+            self.name_problem.set_text(&why);
+            self.name_problem.set_visible(true);
+            return;
+        }
+        self.naming.popdown();
+    }
+
+    /// Write a strategy, new or changed, and choose it.
+    fn store_strategy(self: &Rc<Self>, saved: omacharts_engine::strategy::Saved, named: bool) -> Result<(), String> {
+        let Some(window) = self.window.upgrade() else { return Ok(()) };
+        let saved = match saved.normalised() {
+            Ok(saved) => saved,
+            Err(why) => {
+                if !named {
+                    self.problem.set_text(&why);
+                }
+                return Err(why);
+            }
+        };
+        let mut list = window.store().strategies();
+        if omacharts_engine::strategy::taken(&list, &saved.name, Some(saved.id)) {
+            return Err(format!("there is already a strategy called {:?}", saved.name));
+        }
+        match list.iter_mut().find(|s| s.id == saved.id) {
+            Some(stored) => *stored = saved.clone(),
+            None => list.push(saved.clone()),
+        }
+        window.store().set_strategies(&list);
+        self.chosen.set(Some(saved.id));
+        self.reload_strategies();
+        self.schedule();
+        Ok(())
+    }
+
+    /// Delete the chosen strategy, after asking: it cannot be had back.
+    fn delete_chosen(self: &Rc<Self>) {
+        let Some(saved) = self.chosen_saved() else {
+            self.problem.set_text("Choose a saved strategy to delete");
+            return;
+        };
+        let Some(window) = self.window.upgrade() else { return };
+        let ask = adw::AlertDialog::new(
+            Some(&format!("Delete {:?}?", saved.name)),
+            Some("The rules stay in the form until they are changed; the saved strategy is gone."),
+        );
+        ask.add_response("cancel", "Cancel");
+        ask.add_response("delete", "Delete");
+        ask.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+        ask.set_default_response(Some("cancel"));
+        let weak = Rc::downgrade(self);
+        let id = saved.id;
+        ask.connect_response(None, move |_, response| {
+            let Some(dock) = weak.upgrade() else { return };
+            let Some(window) = dock.window.upgrade() else { return };
+            if response != "delete" {
+                return;
+            }
+            let mut list = window.store().strategies();
+            list.retain(|s| s.id != id);
+            window.store().set_strategies(&list);
+            dock.chosen.set(None);
+            dock.reload_strategies();
+            dock.schedule();
+        });
+        ask.present(Some(&window.window));
     }
 
     /// What the form says now.
@@ -394,6 +734,7 @@ impl Dock {
             risk: self.risk.text().to_string(),
             commission: self.commission.text().to_string(),
             slippage: self.slippage.text().to_string(),
+            strategy: self.chosen.get(),
         }
     }
 
@@ -408,6 +749,7 @@ impl Dock {
         if self.loading.get() {
             return;
         }
+        self.sync_saved();
         self.schedule();
     }
 
