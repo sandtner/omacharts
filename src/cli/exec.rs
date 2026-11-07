@@ -198,6 +198,7 @@ pub fn dispatch(
             outcome
         }
 
+        ("strategy", "backtest") => strategy_backtest(store, m, json, live),
         ("provider", "list") => provider_list(store, json),
         ("provider", "status") => provider_status(store, live, json),
         ("provider", "login") => provider_login(store, m, json),
@@ -4667,6 +4668,258 @@ fn alert_rule_settings(m: &clap::ArgMatches, alert: &mut omacharts_engine::alert
     Ok(())
 }
 
+/// Fetch a series first when nothing is cached or what is cached is old:
+/// here and now with no window, through the window's loader with one, which
+/// answers from the cache this time and the next time from the fetch.
+fn fetch_if_stale(
+    store: &Store,
+    live: Option<&dyn Live>,
+    provider: &dyn omacharts_engine::Provider,
+    instrument: &omacharts_engine::Instrument,
+    key: &str,
+    timeframe: Timeframe,
+    now: i64,
+) {
+    let native = timeframe.native();
+    let stale = store
+        .coverage(key, native)
+        .is_none_or(|c| now - c.fetched_at > omacharts_engine::refresh::period(native));
+    if stale {
+        let series = vec![(instrument.clone(), native)];
+        match live {
+            Some(live) => live.warm_series(&series),
+            None if !cfg!(test) => super::refresh_series(store, provider, &series),
+            None => {}
+        }
+    }
+}
+
+/// A day as people write it, `2020-01-01`, as the moment it starts here.
+fn day_start(flag: &str, text: &str) -> Result<i64, Fault> {
+    use chrono::TimeZone;
+    chrono::NaiveDate::parse_from_str(text.trim(), "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .and_then(|t| chrono::Local.from_local_datetime(&t).earliest())
+        .map(|t| t.timestamp())
+        .ok_or_else(|| Fault::usage(format!("--{flag} is a day such as 2020-01-01, not {text:?}")))
+}
+
+/// Run a strategy over a symbol's history, and say how it did.
+fn strategy_backtest(store: &Store, m: &clap::ArgMatches, as_json: bool, live: Option<&dyn Live>) -> Result<String, Fault> {
+    use omacharts_engine::backtest::{self, Reason, Settings, Stop, Strategy, Target};
+    use omacharts_engine::condition::{Inputs, Rule};
+    use omacharts_engine::position::Stake;
+    let rule = |flag: &str| -> Result<Option<Rule>, Fault> {
+        arg(m, flag).map(|t| Rule::parse(t).map_err(|e| Fault::usage(format!("--{flag}: {e}")))).transpose()
+    };
+    let entry = rule("entry")?.ok_or_else(|| Fault::usage("give --entry, the rule to buy on".into()))?;
+    let strategy = Strategy {
+        entry,
+        exit: rule("exit")?,
+        stop: arg(m, "stop").map(|t| Stop::parse(t).map_err(Fault::usage)).transpose()?,
+        target: arg(m, "target").map(|t| Target::parse(t).map_err(Fault::usage)).transpose()?,
+    };
+    if strategy.exit.is_none() && strategy.stop.is_none() && strategy.target.is_none() {
+        return Err(Fault::usage("a trade needs a way out: give --exit, --stop or --target".into()));
+    }
+    if matches!(strategy.target, Some(Target::R(_))) && strategy.stop.is_none() {
+        return Err(Fault::usage("a target in R is a multiple of the risk, which needs --stop".into()));
+    }
+    let timeframe = alert_timeframe(m)?.unwrap_or(Timeframe::days(1));
+    let mut risk = store.position_risk();
+    if let Some(account) = number(m, "account")? {
+        if !account.is_finite() || account <= 0.0 {
+            return Err(Fault::usage("--account is what the account starts with, more than zero".into()));
+        }
+        risk.account = account;
+    }
+    if let Some(text) = arg(m, "risk") {
+        risk.stake = Stake::parse(text)
+            .ok_or_else(|| Fault::usage(format!("--risk is a percentage such as 1% or an amount such as 250, not {text:?}")))?;
+    }
+    let commission = number(m, "commission")?.unwrap_or(0.0);
+    let slippage = number(m, "slippage")?.unwrap_or(0.05);
+    if !(0.0..1e9).contains(&commission) || !(0.0..50.0).contains(&slippage) {
+        return Err(Fault::usage("--commission and --slippage are zero or more".into()));
+    }
+    let shown = match arg(m, "trades") {
+        None => 10,
+        Some(n) => n.parse::<usize>().map_err(|_| Fault::usage(format!("--trades is a count, not {n:?}")))?,
+    };
+    let from = arg(m, "from").map(|t| day_start("from", t)).transpose()?;
+    let to = arg(m, "to").map(|t| day_start("to", t).map(|ts| ts + 86_400)).transpose()?;
+
+    let (symbol, suffix) = alert_target(store, m, live.is_some())?;
+    let index = crate::inventory::everything();
+    let instrument = index
+        .find(&symbol, suffix.as_deref())
+        .cloned()
+        .ok_or_else(|| Fault::not_found(format!("{symbol} is not an instrument this app knows")))?;
+    let provider = crate::feeds::selected(store);
+    let key = super::cache_key(provider.as_ref(), &instrument)
+        .ok_or_else(|| Fault::refused(format!("{} does not serve {symbol}", provider.id())))?;
+    let now = alert_now();
+    fetch_if_stale(store, live, provider.as_ref(), &instrument, &key, timeframe, now);
+    let mut bars = crate::alerts::rule_bars(store, &instrument, &key, timeframe, None, now);
+    // Decided on closed bars only: the one still forming is not one yet.
+    if crate::alerts::forming(&instrument, &bars, timeframe, now) {
+        bars.pop();
+    }
+    let display = match &suffix {
+        Some(suffix) => format!("{symbol}.{suffix}"),
+        None => symbol.clone(),
+    };
+    if bars.len() < 2 {
+        return Err(Fault::not_found(format!(
+            "no {} bars of {display} are cached yet; open a chart of it, or try again in a moment",
+            timeframe.key()
+        )));
+    }
+    let start = from.map_or(0, |ts| bars.partition_point(|b| b.ts < ts));
+    let end = to.map_or(bars.len(), |ts| bars.partition_point(|b| b.ts < ts));
+    if start >= end {
+        return Err(Fault::usage("--from and --to leave no bars to trade on".into()));
+    }
+    let settings = Settings { account: risk.account, stake: risk.stake, commission, slippage: slippage / 100.0 };
+    let inputs = Inputs { session_origin: instrument.session_origin, timeframe };
+    let report = backtest::run(&strategy, &bars, &inputs, &settings, start..end);
+    if report.from >= report.to {
+        return Err(Fault::not_found(format!(
+            "{} bars are not enough: the entry rule needs {} before it can answer",
+            end - start,
+            strategy.entry.warm_up()
+        )));
+    }
+    let st = &report.stats;
+    let decimals = omacharts_engine::price_decimals(0.0, bars[report.to - 1].close, Some(instrument.kind));
+    let day = |ts: i64| {
+        chrono::DateTime::from_timestamp(ts, 0)
+            .map(|t| {
+                let local = t.with_timezone(&chrono::Local);
+                match timeframe.is_intraday() {
+                    true => local.format("%Y-%m-%d %H:%M").to_string(),
+                    false => local.format("%Y-%m-%d").to_string(),
+                }
+            })
+            .unwrap_or_default()
+    };
+    let describe = {
+        let mut words = vec![format!("long when {}", strategy.entry)];
+        if let Some(exit) = &strategy.exit {
+            words.push(format!("out when {exit}"));
+        }
+        if let Some(stop) = strategy.stop {
+            words.push(format!("stop {}", stop.spell()));
+        }
+        if let Some(target) = strategy.target {
+            words.push(format!("target {}", target.spell()));
+        }
+        words.join(", ")
+    };
+    if as_json {
+        let trades: Vec<Value> = report
+            .trades
+            .iter()
+            .map(|t| {
+                json!({
+                    "entry_ts": t.entry_ts, "exit_ts": t.exit_ts, "entry": t.entry, "exit": t.exit,
+                    "stop": t.stop, "target": t.target, "units": t.units, "pnl": t.pnl, "r": t.r,
+                    "reason": t.reason.key(), "bars": t.exit_at - t.entry_at,
+                })
+            })
+            .collect();
+        return Ok(format!(
+            "{}\n",
+            json!({
+                "symbol": display,
+                "timeframe": timeframe.key(),
+                "strategy": describe,
+                "entry": strategy.entry.to_string(),
+                "exit": strategy.exit.as_ref().map(ToString::to_string),
+                "stop": strategy.stop.map(Stop::spell),
+                "target": strategy.target.map(Target::spell),
+                "from": bars[report.from].ts,
+                "to": bars[report.to - 1].ts,
+                "bars": report.to - report.from,
+                "account": risk.account,
+                "risk": risk.stake.spell(),
+                "currency": risk.currency,
+                "commission": commission,
+                "slippage_pct": slippage,
+                "stats": {
+                    "trades": st.trades, "wins": st.wins, "win_rate": st.win_rate,
+                    "average_r": st.average_r, "expectancy": st.expectancy,
+                    "profit_factor": st.profit_factor, "net_profit": st.net_profit,
+                    "return_pct": st.return_pct, "max_drawdown_pct": st.max_drawdown_pct,
+                    "exposure_pct": st.exposure_pct, "buy_hold_pct": st.buy_hold_pct,
+                    "average_bars": st.average_bars,
+                },
+                "signal_pending": report.signal_pending,
+                "trades": trades,
+                "equity": report.equity,
+            })
+        ));
+    }
+    let money = |v: f64| risk.money(v);
+    let signed = |v: f64| if v >= 0.0 { format!("+{}", money(v)) } else { format!("-{}", money(-v)) };
+    let pct = |v: f64| format!("{v:+.1}%");
+    let mut out = format!("{display} {} · {describe}\n", timeframe.key());
+    out.push_str(&format!(
+        "{} → {} · {} bars · account {}{} · commission {} a fill · slippage {slippage}%\n",
+        day(bars[report.from].ts),
+        day(bars[report.to - 1].ts),
+        report.to - report.from,
+        money(risk.account),
+        match strategy.stop {
+            Some(_) => format!(", risking {} a trade", risk.stake.spell()),
+            None => ", all in (no stop to size by)".into(),
+        },
+        money(commission),
+    ));
+    if st.trades == 0 {
+        out.push_str("no closed trades\n");
+    } else {
+        out.push_str(&format!(
+            "{} trades · won {} ({:.0}%){} · profit factor {} · avg {} a trade\n",
+            st.trades,
+            st.wins,
+            st.win_rate,
+            st.average_r.map(|r| format!(" · avg {r:+.2}R")).unwrap_or_default(),
+            st.profit_factor.map_or("—".into(), |p| format!("{p:.2}")),
+            signed(st.expectancy),
+        ));
+    }
+    out.push_str(&format!(
+        "net {} ({}) · max drawdown {} · in the market {:.0}% · buy and hold {}\n",
+        signed(st.net_profit),
+        pct(st.return_pct),
+        pct(st.max_drawdown_pct),
+        st.exposure_pct,
+        pct(st.buy_hold_pct),
+    ));
+    let listed: Vec<_> = report.trades.iter().rev().take(shown).collect();
+    if !listed.is_empty() {
+        out.push_str(&format!("latest {}:\n", listed.len()));
+        for t in listed.into_iter().rev() {
+            out.push_str(&format!(
+                "  {} → {}  {:.decimals$} → {:.decimals$}  {:<6} {:>7}  {:>9}\n",
+                day(t.entry_ts),
+                if t.reason == Reason::Open { "now".to_string() } else { day(t.exit_ts) },
+                t.entry,
+                t.exit,
+                t.reason.key(),
+                t.r.map(|r| format!("{r:+.2}R")).unwrap_or_default(),
+                signed(t.pnl),
+            ));
+        }
+    }
+    if report.signal_pending {
+        out.push_str("the entry rule holds on the last bar: it buys at the next open\n");
+    }
+    Ok(out)
+}
+
 /// Read a rule over a symbol's bars, and say what it finds.
 fn alert_test(store: &Store, m: &clap::ArgMatches, as_json: bool, live: Option<&dyn Live>) -> Result<String, Fault> {
     use omacharts_engine::condition::{Inputs, Rule};
@@ -4690,21 +4943,7 @@ fn alert_test(store: &Store, m: &clap::ArgMatches, as_json: bool, live: Option<&
     let key = super::cache_key(provider.as_ref(), &instrument)
         .ok_or_else(|| Fault::refused(format!("{} does not serve {symbol}", provider.id())))?;
     let now = alert_now();
-    let native = timeframe.native();
-    // Fetched first when nothing is cached or what is cached is old: here
-    // and now with no window, through the window's loader with one, which
-    // answers from the cache this time and the next time from the fetch.
-    let stale = store
-        .coverage(&key, native)
-        .is_none_or(|c| now - c.fetched_at > omacharts_engine::refresh::period(native));
-    if stale {
-        let series = vec![(instrument.clone(), native)];
-        match live {
-            Some(live) => live.warm_series(&series),
-            None if !cfg!(test) => super::refresh_series(store, provider.as_ref(), &series),
-            None => {}
-        }
-    }
+    fetch_if_stale(store, live, provider.as_ref(), &instrument, &key, timeframe, now);
     let bars = crate::alerts::rule_bars(store, &instrument, &key, timeframe, None, now);
     let display = match &suffix {
         Some(suffix) => format!("{symbol}.{suffix}"),
@@ -7810,6 +8049,65 @@ mod tests {
         assert_eq!(marks.len(), 1, "{marks:?}");
         assert_eq!(marks[0].label, "#2");
         assert_eq!(marks[0].ts, bars[crossed[0]].ts + 86_399);
+    }
+
+    /// A strategy is run over the cached bars, refuses what cannot be a
+    /// strategy, and says what it found in words and in JSON.
+    #[test]
+    fn a_strategy_is_backtested_over_the_cached_bars() {
+        use omacharts_engine::Bar;
+        let store = bare();
+        let index = crate::inventory::everything();
+        let instrument = index.find("AAPL", None).unwrap().clone();
+        let provider = crate::feeds::selected(&store);
+        let key = super::super::cache_key(provider.as_ref(), &instrument).unwrap();
+        // Thirty days down, thirty up, in 2023.
+        let start = 1_700_000_000 / 86_400 * 86_400;
+        let bars: Vec<Bar> = (0..60)
+            .map(|i| {
+                let c = if i < 30 { 200.0 - i as f64 } else { 170.0 + (i - 30) as f64 * 3.0 };
+                Bar { ts: start + i * 86_400, open: c, high: c + 1.0, low: c - 1.0, close: c, volume: 1e6 }
+            })
+            .collect();
+        store.write_bars(&key, Timeframe::days(1), &bars);
+        let words = |line: &[&str]| -> Outcome {
+            let args: Vec<String> =
+                std::iter::once("omacharts").chain(line.iter().copied()).map(String::from).collect();
+            dispatch(&args, &store, None, &super::super::Here)
+        };
+        let cross = ["strategy", "backtest", "AAPL", "--entry", "sma(5) crosses_above sma(20)"];
+
+        // Bought on the way back up and never sold: one trade, still open.
+        let out = words(&[&cross[..], &["--exit", "sma(5) crosses_below sma(20)"]].concat());
+        assert_eq!(out.code, 0, "{}", out.err);
+        assert!(out.out.starts_with("AAPL 1D · long when sma(5) crosses_above sma(20), out when"), "{}", out.out);
+        assert!(out.out.contains("no closed trades"), "{}", out.out);
+        assert!(out.out.contains("→ now"), "{}", out.out);
+
+        // A 5% target is reached on the way up.
+        let out = words(&[&cross[..], &["--stop", "3%", "--target", "5%", "--json"]].concat());
+        assert_eq!(out.code, 0, "{}", out.err);
+        let value: Value = serde_json::from_str(&out.out).unwrap();
+        assert_eq!(value["stats"]["trades"], json!(1));
+        assert_eq!(value["stats"]["wins"], json!(1));
+        assert_eq!(value["trades"][0]["reason"], json!("target"));
+        assert!(value["trades"][0]["r"].as_f64().unwrap() > 1.0);
+        assert_eq!(value["stop"], json!("3%"));
+        assert_eq!(value["equity"].as_array().unwrap().len(), value["bars"].as_u64().unwrap() as usize);
+
+        let usage = |line: &[&str]| assert_eq!(words(line).code, EXIT_USAGE, "{line:?}");
+        usage(&["strategy", "backtest", "AAPL", "--exit", "close < 3"]);
+        usage(&cross);
+        usage(&[&cross[..], &["--target", "2R"]].concat());
+        usage(&[&cross[..], &["--stop", "two atr"]].concat());
+        usage(&[&cross[..], &["--stop", "3%", "--from", "yesterday"]].concat());
+        usage(&[&cross[..], &["--stop", "3%", "--from", "2030-01-01"]].concat());
+        usage(&[&cross[..], &["--stop", "3%", "--risk", "lots"]].concat());
+        assert_eq!(
+            words(&[&cross[..], &["--stop", "3%", "--timeframe", "1h"]].concat()).code,
+            super::super::EXIT_NOT_FOUND,
+            "nothing hourly cached"
+        );
     }
 
     #[test]

@@ -983,6 +983,57 @@ own bar closed. While the editor is open, the rule being edited is shown
 as hollow triangles instead, and follows each change to it. Expired alerts
 leave no marks. `alert test` lists the same bars as text.
 
+## Backtesting a strategy
+
+`strategy backtest` runs a strategy over a symbol's cached history and says
+what it would have done. A strategy is an entry rule and a way out: an exit
+rule, a stop, a target, or any of them together. The rules are the language
+of [Rules over the bars](#rules-over-the-bars).
+
+| Flag | Means |
+| --- | --- |
+| `--entry RULE` | buy at the next open when this starts to hold |
+| `--exit RULE` | sell at the next open when this holds |
+| `--stop STOP` | `2*atr(14)` (the ATR on the signal bar) or `3%` below the fill |
+| `--target TARGET` | `2R` (twice the distance to the stop) or `8%` above the fill |
+| `--timeframe TF` | the bars to trade on, `1D` by default |
+| `--from`, `--to` | trade only between these days; indicators still see the history before |
+| `--account`, `--risk` | what the account starts with and what a trade may lose; `config risk`'s by default |
+| `--commission` | paid on every fill, 0 by default |
+| `--slippage` | percent of the price lost on every fill, 0.05 by default |
+
+It keeps to what could have been done at the time:
+
+- Long only, one position at a time.
+- A rule is asked about a bar once it has closed, and acted on at the next
+  bar's open. The bar still forming is left out.
+- The stop and the target are watched inside every bar from the fill on. A
+  bar that opens past the stop fills at the open. A bar that reaches both
+  counts as stopped, since the order inside a bar is not known.
+- With a stop, a trade risks the stake of the account as it stands, so
+  results compound, and is bought in whole shares where one is affordable.
+  Without a stop there is nothing to size by, and the whole account goes in.
+  Never more than the account.
+- A trade still open at the end is listed and valued at the last close, but
+  not counted in the figures.
+
+```sh
+omacharts strategy backtest SPY --entry "sma(20) crosses_above sma(50)" --exit "sma(20) crosses_below sma(50)" --stop "2*atr(14)" --commission 1
+# SPY 1D · long when sma(20) crosses_above sma(50), out when sma(20) crosses_below sma(50), stop 2*atr(14)
+# 2007-03-08 → 2026-11-06 · 4950 bars · account 10,000, risking 1% a trade · commission 1 a fill · slippage 0.05%
+# 51 trades · won 21 (41%) · avg +0.45R · profit factor 1.72 · avg +45.42 a trade
+# net +2,317 (+23.2%) · max drawdown -9.1% · in the market 47% · buy and hold +422.4%
+# latest 10: …
+omacharts strategy backtest NVDA --timeframe 1h --entry "rsi(14) crosses_above 30" --stop 3% --target 2R --from 2026-01-01
+omacharts strategy backtest QQQ --entry "close > ema(200)" --exit "close < ema(200)" --json   # every trade and the equity curve
+```
+
+The figures are the closed trades, the wins and the win rate; the average R
+over trades with a stop; the profit factor (gross profit over gross loss);
+the average result a trade; the net result and its percentage; the deepest
+fall of the account from a high; how much of the time a position was held;
+and holding the symbol over the same bars, for comparison.
+
 ## Measuring a move
 
 With a window open, `chart measure` puts the ruler on the focused chart between
@@ -1530,6 +1581,7 @@ story, and adding a manifest would be a second thing to maintain for nothing.
 | `chart` | the charts inside a chartbook |
 | `template` | chart templates: named sets of indicators that charts share |
 | `alert` | price and indicator alerts, as desktop notifications; `alert test` reads a rule over the bars |
+| `strategy` | strategies as rules over the bars; `strategy backtest` runs one over a symbol's history |
 | `provider` | the data feed, and signing in to one that needs it |
 | `config` | stored preferences |
 | `cache` | the cached market data |

@@ -6,6 +6,7 @@
 //! keeps the provider boundary honest.
 
 pub mod alert;
+pub mod backtest;
 pub mod bars;
 pub mod clock;
 pub mod condition;
