@@ -997,10 +997,12 @@ of [Rules over the bars](#rules-over-the-bars).
 | `--stop STOP` | `2*atr(14)` (the ATR on the signal bar) or `3%` below the fill |
 | `--target TARGET` | `2R` (twice the distance to the stop) or `8%` above the fill |
 | `--timeframe TF` | the bars to trade on, `1D` by default |
+| `--last LENGTH` | trade only over the last `90d`, `6w`, `2mo` or `1y` before the last closed bar |
 | `--from`, `--to` | trade only between these days; indicators still see the history before |
 | `--account`, `--risk` | what the account starts with and what a trade may lose; `config risk`'s by default |
 | `--commission` | paid on every fill, 0 by default |
 | `--slippage` | percent of the price lost on every fill, 0.05 by default |
+| `--show` | also open the backtest dock on the focused chart with this strategy |
 
 It keeps to what could have been done at the time:
 
@@ -1027,6 +1029,39 @@ omacharts strategy backtest SPY --entry "sma(20) crosses_above sma(50)" --exit "
 omacharts strategy backtest NVDA --timeframe 1h --entry "rsi(14) crosses_above 30" --stop 3% --target 2R --from 2026-01-01
 omacharts strategy backtest QQQ --entry "close > ema(200)" --exit "close < ema(200)" --json   # every trade and the equity curve
 ```
+
+### The backtest dock
+
+In the window, Ctrl+Shift+B opens the backtest dock under the charts. The
+chart's right-click menu has "Backtest a strategy…" too. The dock runs on
+the focused chart: its symbol, its resolution, and the bars it draws. It
+runs again a moment after the form changes, and when the focus, the symbol,
+the resolution or the bars move. The form is kept between sessions.
+`omacharts strategy backtest --entry … --show` opens it from a terminal
+with that strategy.
+
+- **Left, the form:** buy and sell rules, stop, target, account, risk,
+  commission and slippage. A field that cannot be read is marked, with what
+  is wrong under the form. The period is picked in the dock's header: 1, 3
+  or 6 months, 1, 2 or 5 years, all of it, or custom days.
+- **Middle, the verdict:** the net result, buy and hold over the same bars,
+  the trades and the share won, the profit factor, the average R, the max
+  drawdown and the time in the market. Under them, the account over the
+  period as a line, shaded green above where it started and red below,
+  with holding the symbol as a dashed line on the same scale.
+- **Right, the trades:** newest first, with dates, prices, why each ended,
+  the size, and what it made. Picking one brings it into view on the chart
+  and draws it stronger. The button beside the period shows the whole
+  tested period.
+
+On the chart, each trade is a box from its entry to its exit, in time and
+in price: green for a win and red for a loss. Its stop and target are dotted
+lines over the time it was held, and a dashed line runs from where it went in
+to where it came out. A triangle under the entry bar marks the buy, and one
+over the exit bar marks the sale, labelled with the result (`+2.1R`, or a
+percentage without a stop). A trade still open has a hollow exit marker.
+Bars outside the tested period are dimmed. Closing the dock takes it all
+away.
 
 The figures are the closed trades, the wins and the win rate; the average R
 over trades with a stop; the profit factor (gross profit over gross loss);

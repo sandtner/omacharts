@@ -51,6 +51,8 @@ pub const BINDINGS: &[Binding] = &[
     global("win.alerts", &["<Ctrl><Shift>a"]),
     // Alt+A is the arrow tool's, so a new alert is the same key with Shift.
     global("win.new-alert", &["<Alt><Shift>a"]),
+    // B for backtest, with Shift: Ctrl+B on its own is the rail.
+    global("win.backtest", &["<Ctrl><Shift>b"]),
     global("chart.indicators", &["<Ctrl>i"]),
     // A letter, because Shift and punctuation together is a trap. GTK
     // matches the keyval the key produces *after* modifiers, and shifting

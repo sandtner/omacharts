@@ -4749,6 +4749,58 @@ fn strategy_backtest(store: &Store, m: &clap::ArgMatches, as_json: bool, live: O
     };
     let from = arg(m, "from").map(|t| day_start("from", t)).transpose()?;
     let to = arg(m, "to").map(|t| day_start("to", t).map(|ts| ts + 86_400)).transpose()?;
+    let last = arg(m, "last");
+    if last.is_some() && (from.is_some() || to.is_some()) {
+        return Err(Fault::usage("--last is a period up to the last bar; give it or --from/--to, not both".into()));
+    }
+    if let Some(text) = last
+        && crate::backtests::period_start(text, 0).is_none()
+    {
+        return Err(Fault::usage(format!("--last is a length such as 90d, 6w, 2mo or 1y, not {text:?}")));
+    }
+    let show = flag(m, "show");
+    if show {
+        if arg(m, "SYMBOL").is_some() || arg(m, "timeframe").is_some() {
+            return Err(Fault::usage(
+                "--show runs on the focused chart, its symbol and resolution; leave out SYMBOL and --timeframe".into(),
+            ));
+        }
+        let Some(live) = live else { return Err(Fault::no_window("focused chart")) };
+        let text = |flag: &str| arg(m, flag).cloned().unwrap_or_default();
+        let request = crate::backtests::Request {
+            entry: text("entry"),
+            exit: text("exit"),
+            stop: text("stop"),
+            target: text("target"),
+            period: match (last, from.is_some() || to.is_some()) {
+                (Some(length), _) => length.clone(),
+                (None, true) => "custom".into(),
+                (None, false) => "all".into(),
+            },
+            from: text("from"),
+            to: text("to"),
+            account: text("account"),
+            risk: text("risk"),
+            commission: arg(m, "commission").cloned().unwrap_or_else(|| "0".into()),
+            slippage: arg(m, "slippage").cloned().unwrap_or_else(|| "0.05".into()),
+        };
+        live.show_backtest(&request)?;
+    }
+    let timeframe = match (show, live) {
+        // The chart's own resolution, so the words say what the dock shows.
+        (true, Some(_)) => {
+            let workspace = Workspace::load(store);
+            let at = workspace.resolve(None)?;
+            let book = workspace.book(at)?.clone();
+            let pane = charts::resolve_pane(&book, None)?;
+            charts::panes(&book)
+                .iter()
+                .find(|p| p["id"].as_u64() == Some(pane as u64))
+                .and_then(|p| p["timeframe"].as_str().and_then(Timeframe::parse))
+                .unwrap_or(timeframe)
+        }
+        _ => timeframe,
+    };
 
     let (symbol, suffix) = alert_target(store, m, live.is_some())?;
     let index = crate::inventory::everything();
@@ -4776,6 +4828,10 @@ fn strategy_backtest(store: &Store, m: &clap::ArgMatches, as_json: bool, live: O
             timeframe.key()
         )));
     }
+    let from = match (last, bars.last()) {
+        (Some(length), Some(newest)) => crate::backtests::period_start(length, newest.ts),
+        _ => from,
+    };
     let start = from.map_or(0, |ts| bars.partition_point(|b| b.ts < ts));
     let end = to.map_or(bars.len(), |ts| bars.partition_point(|b| b.ts < ts));
     if start >= end {
@@ -8108,6 +8164,18 @@ mod tests {
             super::super::EXIT_NOT_FOUND,
             "nothing hourly cached"
         );
+
+        // The last three weeks: the bars on the way up, nothing before.
+        let out = words(&[&cross[..], &["--stop", "3%", "--last", "3w", "--json"]].concat());
+        assert_eq!(out.code, 0, "{}", out.err);
+        let value: Value = serde_json::from_str(&out.out).unwrap();
+        assert_eq!(value["bars"], json!(22));
+        usage(&[&cross[..], &["--stop", "3%", "--last", "a while"]].concat());
+        usage(&[&cross[..], &["--stop", "3%", "--last", "2mo", "--from", "2023-01-01"]].concat());
+        // The dock is the window's.
+        usage(&[&cross[..], &["--stop", "3%", "--show"]].concat());
+        let dock = ["strategy", "backtest", "--entry", "sma(5) crosses_above sma(20)", "--stop", "3%", "--show"];
+        assert_eq!(words(&dock).code, super::super::EXIT_NO_WINDOW);
     }
 
     #[test]

@@ -71,6 +71,7 @@ const SHARED: &[&str] = &[
     "chartbook_templates",
     "chart_time_zone",
     "time_format",
+    "backtest_request",
 ];
 
 pub fn kind(key: &str) -> Kind {

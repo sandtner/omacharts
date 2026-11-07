@@ -265,6 +265,8 @@ struct State {
     /// Where a rule being edited would have fired, shown while its editor
     /// is open.
     preview_markers: Vec<crate::alerts::Marker>,
+    /// A backtest's trades, laid over the bars while its dock is open.
+    backtest: Option<crate::backtests::Marks>,
     /// What this chart shares its drawings with, which is also the scope a
     /// drawing made on it gets.
     /// Whether a drawing made here goes to the symbol or stays on this
@@ -1187,6 +1189,7 @@ impl State {
             alert_levels: Vec::new(),
             rule_markers: Vec::new(),
             preview_markers: Vec::new(),
+            backtest: None,
             sends: true,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -2882,6 +2885,43 @@ impl ChartView {
             return;
         }
         state.preview_markers = markers;
+        drop(state);
+        self.redraw();
+    }
+
+    /// A backtest's trades to lay over the bars, or `None` to take them away.
+    pub fn set_backtest(&self, marks: Option<crate::backtests::Marks>) {
+        let mut state = self.state.borrow_mut();
+        if state.backtest == marks {
+            return;
+        }
+        state.backtest = marks;
+        drop(state);
+        self.redraw();
+    }
+
+    /// Bring a stretch of time into view, keeping the zoom unless the
+    /// stretch needs more room than it gives: a trade picked from a list.
+    pub fn reveal(&self, from: i64, to: i64) {
+        let mut state = self.state.borrow_mut();
+        let len = state.bars.len();
+        if len == 0 {
+            return;
+        }
+        let a = state.bars.partition_point(|b| b.ts < from).min(len - 1);
+        let b = state.bars.partition_point(|b| b.ts <= to).clamp(a + 1, len);
+        let span = b - a;
+        let visible = state.visible.max(span + span / 2 + 10).clamp(MIN_VISIBLE, MAX_VISIBLE);
+        let pad = visible.saturating_sub(span) / 2;
+        state.range = None;
+        state.lead = 0;
+        state.overhang = 0;
+        state.visible = visible;
+        state.first = a.saturating_sub(pad).min(len.saturating_sub(visible.min(len)));
+        state.anchored = state.first + visible >= len + RIGHT_MARGIN;
+        if state.anchored {
+            state.overhang = RIGHT_MARGIN;
+        }
         drop(state);
         self.redraw();
     }
@@ -4967,12 +5007,14 @@ fn draw(cr: &cairo::Context, width: f64, height: f64, state: &State) {
     cr.rectangle(plot_x, price_y, plot_w, price_h);
     cr.clip();
     draw_indicator_fills(cr, state, &columns, &to_y);
+    draw_backtest_ground(cr, state, &plan, &scale);
     draw_candles(cr, state, &columns, &to_y);
     draw_indicator_lines(cr, state, &columns, &to_y);
     cr.restore().ok();
     draw_drawings(cr, state, &plan, &scale);
     draw_alert_levels(cr, state, &plan, &scale);
     draw_rule_markers(cr, state, &plan, &scale);
+    draw_backtest_marks(cr, state, &plan, &scale);
 
     for (at, row) in plan.rows.iter().enumerate() {
         draw_row_edge(cr, state, &plan, at);
@@ -6624,6 +6666,177 @@ fn draw_rule_markers(cr: &cairo::Context, state: &State, plan: &Layout, scale: &
         let _ = cr.stroke_preserve();
         colors::set_source(cr, &amber);
         let _ = cr.fill();
+    }
+    cr.restore().ok();
+}
+
+/// Where a backtest's moments fall on this chart: the column a bar holding
+/// `ts` is drawn in, as an x for its centre, and the bar.
+struct BacktestGeometry {
+    left: f64,
+    bar_w: f64,
+    plot_x: f64,
+}
+
+impl BacktestGeometry {
+    fn of(state: &State, plan: &Layout) -> BacktestGeometry {
+        let (first, _, lead) = state.view();
+        BacktestGeometry {
+            left: first as f64 - lead as f64,
+            bar_w: plan.plot_w / state.columns().max(1) as f64,
+            plot_x: plan.plot_x,
+        }
+    }
+
+    /// The bar holding `ts`: the last that opened by then.
+    fn bar(&self, state: &State, ts: i64) -> Option<usize> {
+        state.bars.partition_point(|b| b.ts <= ts).checked_sub(1)
+    }
+
+    fn x(&self, at: usize) -> f64 {
+        self.plot_x + (at as f64 - self.left + 0.5) * self.bar_w
+    }
+}
+
+/// Under the candles: each trade as a box from its entry to its exit, in
+/// time and in price, green for a win and red for a loss, so the run of
+/// trades reads at a glance — how long each was held, how far it went, and
+/// which way. The one picked in the list is drawn stronger.
+fn draw_backtest_ground(cr: &cairo::Context, state: &State, plan: &Layout, scale: &PriceScale) {
+    let Some(marks) = &state.backtest else { return };
+    if state.bars.is_empty() {
+        return;
+    }
+    let g = BacktestGeometry::of(state, plan);
+    let to_y = |p: f64| scale.to_y(p, plan.price_y, plan.price_h);
+    for (n, t) in marks.trades.iter().enumerate() {
+        let (Some(a), Some(b)) = (g.bar(state, t.entry_ts), g.bar(state, t.exit_ts)) else { continue };
+        let (x0, x1) = (g.x(a) - g.bar_w / 2.0, g.x(b) + g.bar_w / 2.0);
+        if x1 < plan.plot_x || x0 > plan.plot_x + plan.plot_w {
+            continue;
+        }
+        let colour = if t.win { &state.scheme.up } else { &state.scheme.down };
+        let picked = marks.selected == Some(n);
+        let (y0, y1) = (to_y(t.entry), to_y(t.exit));
+        colors::set_source_alpha(cr, colour, if picked { 0.30 } else { 0.14 });
+        cr.rectangle(x0, y0.min(y1), (x1 - x0).max(1.0), (y1 - y0).abs().max(1.0));
+        let _ = cr.fill();
+        if picked {
+            // The whole height of the plot, faintly, so the trade is found
+            // again among the others.
+            colors::set_source_alpha(cr, colour, 0.07);
+            cr.rectangle(x0, plan.price_y, (x1 - x0).max(1.0), plan.price_h);
+            let _ = cr.fill();
+        }
+    }
+}
+
+/// Over the candles: the bars outside the tested period dimmed, each
+/// trade's stop and target as dotted lines over the time it was held, a
+/// line from where it went in to where it came out, a triangle under the
+/// entry bar and one over the exit bar, and what the trade made above it.
+fn draw_backtest_marks(cr: &cairo::Context, state: &State, plan: &Layout, scale: &PriceScale) {
+    let Some(marks) = &state.backtest else { return };
+    if state.bars.is_empty() {
+        return;
+    }
+    let g = BacktestGeometry::of(state, plan);
+    let to_y = |p: f64| scale.to_y(p, plan.price_y, plan.price_h);
+    let (left_edge, right_edge) = (plan.plot_x, plan.plot_x + plan.plot_w);
+    cr.save().ok();
+    cr.rectangle(plan.plot_x, plan.price_y, plan.plot_w, plan.price_h);
+    cr.clip();
+
+    // Outside the period: the chart's own colour laid half over the bars,
+    // so what was not tested recedes without disappearing.
+    let background = &state.theme.ui.background;
+    if let Some(a) = g.bar(state, marks.from_ts) {
+        let x = (g.x(a) - g.bar_w / 2.0).clamp(left_edge, right_edge);
+        colors::set_source_alpha(cr, background, 0.6);
+        cr.rectangle(left_edge, plan.price_y, x - left_edge, plan.price_h);
+        let _ = cr.fill();
+    }
+    if let Some(b) = g.bar(state, marks.to_ts) {
+        let x = (g.x(b) + g.bar_w / 2.0).clamp(left_edge, right_edge);
+        colors::set_source_alpha(cr, background, 0.6);
+        cr.rectangle(x, plan.price_y, right_edge - x, plan.price_h);
+        let _ = cr.fill();
+    }
+
+    cr.select_font_face("sans-serif", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
+    cr.set_font_size(10.0);
+    let size = (g.bar_w * 0.8).clamp(7.0, 10.0);
+    let fg = &state.theme.ui.text;
+    let mut label_end = f64::NEG_INFINITY;
+    for (n, t) in marks.trades.iter().enumerate() {
+        let (Some(a), Some(b)) = (g.bar(state, t.entry_ts), g.bar(state, t.exit_ts)) else { continue };
+        let (xa, xb) = (g.x(a), g.x(b));
+        if xb + g.bar_w < left_edge || xa - g.bar_w > right_edge {
+            continue;
+        }
+        let picked = marks.selected == Some(n);
+        let outcome = if t.win { &state.scheme.up } else { &state.scheme.down };
+        let (x0, x1) = (xa - g.bar_w / 2.0, xb + g.bar_w / 2.0);
+        // The stop and the target, over the time they stood.
+        cr.set_line_width(1.0);
+        cr.set_dash(&[2.0, 2.0], 0.0);
+        for (level, colour) in [(t.stop, &state.scheme.down), (t.target, &state.scheme.up)] {
+            let Some(level) = level else { continue };
+            let y = to_y(level).round() + 0.5;
+            colors::set_source_alpha(cr, colour, if picked { 1.0 } else { 0.7 });
+            cr.move_to(x0, y);
+            cr.line_to(x1, y);
+            let _ = cr.stroke();
+        }
+        // In to out.
+        cr.set_dash(&[4.0, 3.0], 0.0);
+        colors::set_source_alpha(cr, outcome, if picked { 1.0 } else { 0.8 });
+        cr.set_line_width(if picked { 1.6 } else { 1.0 });
+        cr.move_to(xa, to_y(t.entry));
+        cr.line_to(xb, to_y(t.exit));
+        let _ = cr.stroke();
+        cr.set_dash(&[], 0.0);
+
+        // The entry: a triangle under the bar, pointing up at it, in the
+        // chart's own ink — a buy is not yet a win or a loss.
+        let low = to_y(state.bars[a].low) + 4.0;
+        cr.move_to(xa, low);
+        cr.line_to(xa + size / 2.0, low + size);
+        cr.line_to(xa - size / 2.0, low + size);
+        cr.close_path();
+        colors::set_source_alpha(cr, fg, 0.85);
+        let _ = cr.fill();
+        // The exit: over the bar, pointing down, in the trade's colour.
+        // Hollow while the trade is still open.
+        let high = to_y(state.bars[b].high) - 4.0;
+        cr.move_to(xb, high);
+        cr.line_to(xb + size / 2.0, high - size);
+        cr.line_to(xb - size / 2.0, high - size);
+        cr.close_path();
+        colors::set_source(cr, outcome);
+        match t.open {
+            true => {
+                cr.set_line_width(1.4);
+                let _ = cr.stroke();
+            }
+            false => {
+                let _ = cr.fill();
+            }
+        }
+        // What it made, over the exit, while there is room for it.
+        let text = if t.open { format!("{} open", t.label) } else { t.label.clone() };
+        let w = cr.text_extents(&text).map(|e| e.x_advance()).unwrap_or(0.0);
+        let tx = (xb - w / 2.0).round();
+        if tx >= label_end + 4.0 || picked {
+            label_end = tx + w;
+            cr.move_to(tx, high - size - 4.0);
+            cr.text_path(&text);
+            colors::set_source(cr, background);
+            cr.set_line_width(3.0);
+            let _ = cr.stroke_preserve();
+            colors::set_source(cr, outcome);
+            let _ = cr.fill();
+        }
     }
     cr.restore().ok();
 }

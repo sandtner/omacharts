@@ -152,6 +152,7 @@ const SHORTCUT_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl+,", "Preferences"),
             ("Ctrl+Shift+A", "Alerts"),
             ("Alt+Shift+A", "New alert on this chart"),
+            ("Ctrl+Shift+B", "Backtest a strategy on this chart"),
             ("F10", "Main menu"),
             ("? · Ctrl+?", "This list"),
             ("Ctrl+Q", "Quit"),
@@ -1995,6 +1996,10 @@ pub struct Window {
     /// the other: a backfill paused for five minutes must not also stop the
     /// chart somebody is watching from keeping itself current.
     refresh_quiet_until: Cell<Option<std::time::Instant>>,
+    /// The charts over the backtest dock. The dock is put in the first time
+    /// it is opened, and hidden rather than taken out after.
+    backtest_split: gtk::Paned,
+    backtest: RefCell<Option<Rc<crate::ui::backtest_dock::Dock>>>,
 }
 
 impl Window {
@@ -2109,6 +2114,8 @@ impl Window {
             )),
             backfill_quiet_until: Cell::new(None),
             refresh_quiet_until: Cell::new(None),
+            backtest_split: gtk::Paned::new(gtk::Orientation::Vertical),
+            backtest: RefCell::new(None),
         });
 
         let watchlist = this.build_watchlist();
@@ -2172,7 +2179,14 @@ impl Window {
         with_tools.append(&chart_host);
         bar.set_shown(store.setting_bool(SHOW_DRAWING_TOOLS, false));
         *this.drawing_bar.borrow_mut() = Some(bar);
-        split.set_start_child(Some(&with_tools));
+        // The charts over the backtest dock, which takes the room it is
+        // given and no more: a wider window is more chart.
+        let charts_over_dock = &this.backtest_split;
+        charts_over_dock.set_start_child(Some(&with_tools));
+        charts_over_dock.set_resize_start_child(true);
+        charts_over_dock.set_resize_end_child(false);
+        charts_over_dock.set_shrink_end_child(false);
+        split.set_start_child(Some(charts_over_dock));
 
         // No header bar: the window's controls float over its top-right
         // corner, and the chart gets the row the bar used to take.
@@ -2628,6 +2642,7 @@ impl Window {
         for pane in self.panes.borrow().iter() {
             pane.set_focused(pane.id == id);
         }
+        self.backtest_follow();
         // What is left in the header describes the focused chart, as do the
         // chart menu's radio items.
         self.sync_header();
@@ -4964,6 +4979,11 @@ impl Window {
         alerts.connect_activate(move |_, _| crate::ui::alerts::present(&this));
         self.window.add_action(&alerts);
 
+        let backtest = gio::SimpleAction::new("backtest", None);
+        let this = self.clone();
+        backtest.connect_activate(move |_, _| this.toggle_backtest());
+        self.window.add_action(&backtest);
+
         let new_alert = gio::SimpleAction::new("new-alert", None);
         let this = self.clone();
         new_alert.connect_activate(move |_, _| crate::ui::alert_editor::present_new(&this, None));
@@ -6008,6 +6028,9 @@ impl Window {
             instrument.suffix.as_deref(),
         ));
         pane.view.set_rule_markers(self.rule_markers(&instrument));
+        if pane.id == self.focused.get() {
+            self.backtest_follow();
+        }
 
         // Only the focused chart drives the rail and the prefetch window: the
         // others are not where the next keystroke is going.
@@ -8210,8 +8233,79 @@ impl Window {
             let Some(instrument) = instrument else { continue };
             if crate::cli::cache_key(provider.as_ref(), &instrument).as_deref() == Some(key) {
                 pane.view.set_rule_markers(self.rule_markers(&instrument));
+                if pane.id == self.focused.get() {
+                    self.backtest_follow();
+                }
             }
         }
+    }
+
+    /// Open the backtest dock under the charts, or close it.
+    pub fn toggle_backtest(self: &Rc<Self>) {
+        let dock = self.backtest.borrow().clone();
+        let dock = match dock {
+            Some(dock) => dock,
+            None => {
+                let dock = crate::ui::backtest_dock::Dock::new(self);
+                dock.root.set_visible(false);
+                self.backtest_split.set_end_child(Some(&dock.root));
+                *self.backtest.borrow_mut() = Some(dock.clone());
+                dock
+            }
+        };
+        let open = !dock.root.is_visible();
+        dock.root.set_visible(open);
+        match open {
+            true => {
+                // About a third of the window, the first time: room for the
+                // figures and a curve, and most of it still chart.
+                let height = self.backtest_split.height();
+                if self.backtest_split.position() <= 0 || self.backtest_split.position() > height - 120 {
+                    self.backtest_split.set_position((height as f64 * 0.66) as i32);
+                }
+                dock.run();
+            }
+            false => {
+                dock.hidden();
+                self.focused_pane().view.area.grab_focus();
+            }
+        }
+    }
+
+    /// Open the dock on a request, as a command asks: `strategy backtest --show`.
+    pub fn open_backtest(self: &Rc<Self>, request: &crate::backtests::Request) {
+        let open = self.backtest.borrow().as_ref().is_some_and(|d| d.root.is_visible());
+        if !open {
+            self.toggle_backtest();
+        }
+        if let Some(dock) = self.backtest.borrow().clone() {
+            dock.load(request);
+            dock.run();
+        }
+    }
+
+    /// Run the open dock again: the focus, the symbol, the resolution or
+    /// the bars under it moved.
+    fn backtest_follow(&self) {
+        let dock = self.backtest.borrow().clone();
+        if let Some(dock) = dock
+            && dock.root.is_visible()
+        {
+            dock.schedule();
+        }
+    }
+
+    /// Lay a backtest's trades over chart `pane`, and take them off every
+    /// other chart; `None` takes them off all.
+    pub fn show_backtest_marks(&self, pane: u32, marks: Option<crate::backtests::Marks>) {
+        for each in self.panes.borrow().iter() {
+            each.view.set_backtest(if each.id == pane { marks.clone() } else { None });
+        }
+    }
+
+    /// Chart `id`'s view, for the dock to scroll.
+    pub fn chart_view(&self, id: u32) -> Option<Rc<crate::ui::chart::ChartView>> {
+        self.pane(id).map(|p| p.view.clone())
     }
 
     /// Show where a rule being edited would have fired, on every chart of
@@ -8819,6 +8913,7 @@ impl Window {
             item.set_action_and_target_value(Some("chart.alert-at"), Some(&price.to_variant()));
             let alerts = gio::Menu::new();
             alerts.append_item(&item);
+            shortcuts::append_with_key(&alerts, "Backtest a strategy…", "win.backtest", "<Ctrl><Shift>b");
             menu.append_section(None, &alerts);
         }
 

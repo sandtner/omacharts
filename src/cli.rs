@@ -286,6 +286,11 @@ pub trait Live {
     /// Queue batches of closes on the window's loader, the same bargain as
     /// [`Self::warm`] for the rows a batch can cover.
     fn warm_closes(&self, batches: Vec<Vec<Listing>>);
+    /// Open the backtest dock on the focused chart with this strategy.
+    fn show_backtest(&self, _request: &crate::backtests::Request) -> Result<(), Fault> {
+        Err(Fault::no_window("focused chart"))
+    }
+
     /// Queue the bar series rule alerts read, on the window's loader, the
     /// same bargain as [`Self::warm`]. Nothing to do without a window.
     fn warm_series(&self, _series: &[(Instrument, Timeframe)]) {}
@@ -1093,6 +1098,11 @@ impl Live for Rc<crate::ui::Window> {
 
     fn warm_series(&self, series: &[(Instrument, Timeframe)]) {
         crate::ui::Window::warm_series(self, series);
+    }
+
+    fn show_backtest(&self, request: &crate::backtests::Request) -> Result<(), Fault> {
+        crate::ui::Window::open_backtest(self, request);
+        Ok(())
     }
 
     fn symbols(&self) -> Option<Rc<SearchIndex>> {
