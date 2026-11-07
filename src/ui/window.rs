@@ -5422,6 +5422,7 @@ impl Window {
                             this.check_alert_price(&key, newest.close);
                         }
                         this.present(&key, timeframe, bars, None);
+                        this.refresh_rule_markers(&key);
                         // One at a time, each asked for as the last lands.
                         this.loader().keep_warming(&key, timeframe, |tf| {
                             this.store.coverage(&key, tf).is_some()
@@ -6006,6 +6007,7 @@ impl Window {
             &instrument.symbol,
             instrument.suffix.as_deref(),
         ));
+        pane.view.set_rule_markers(self.rule_markers(&instrument));
 
         // Only the focused chart drives the rail and the prefetch window: the
         // others are not where the next keystroke is going.
@@ -8187,6 +8189,55 @@ impl Window {
                     &self.store,
                     &instrument.symbol,
                     instrument.suffix.as_deref(),
+                ));
+                pane.view.set_rule_markers(self.rule_markers(&instrument));
+            }
+        }
+    }
+
+    /// Where the rule alerts on `instrument` fired, for its charts to mark.
+    fn rule_markers(&self, instrument: &Instrument) -> Vec<crate::alerts::Marker> {
+        let now = chrono::Utc::now().timestamp();
+        crate::alerts::markers(&self.store, self.provider().as_ref(), instrument, now)
+    }
+
+    /// Mark again, on every chart of the series under `key`, where its rule
+    /// alerts fired: new bars can be new places where a rule holds.
+    fn refresh_rule_markers(&self, key: &str) {
+        let provider = self.provider();
+        for pane in self.panes.borrow().iter() {
+            let instrument = pane.instrument.borrow().clone();
+            let Some(instrument) = instrument else { continue };
+            if crate::cli::cache_key(provider.as_ref(), &instrument).as_deref() == Some(key) {
+                pane.view.set_rule_markers(self.rule_markers(&instrument));
+            }
+        }
+    }
+
+    /// Show where a rule being edited would have fired, on every chart of
+    /// its symbol; `None` takes the preview away.
+    pub fn preview_rule(&self, alert: Option<&omacharts_engine::alert::Alert>) {
+        let now = chrono::Utc::now().timestamp();
+        let provider = self.provider();
+        for pane in self.panes.borrow().iter() {
+            let instrument = pane.instrument.borrow().clone();
+            let markers = match (alert, instrument) {
+                (Some(alert), Some(instrument)) if alert.is_for(&instrument.symbol, instrument.suffix.as_deref()) => {
+                    crate::alerts::markers_for(&self.store, provider.as_ref(), &instrument, alert, now)
+                }
+                _ => Vec::new(),
+            };
+            pane.view.set_preview_markers(markers);
+            // The alert being edited shows only as its preview, not twice.
+            let instrument = pane.instrument.borrow().clone();
+            if let Some(instrument) = instrument {
+                let except = alert.map(|a| a.id).filter(|id| *id != 0);
+                pane.view.set_rule_markers(crate::alerts::markers_except(
+                    &self.store,
+                    provider.as_ref(),
+                    &instrument,
+                    now,
+                    except,
                 ));
             }
         }

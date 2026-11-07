@@ -204,6 +204,59 @@ pub fn rule_bars(
     bars
 }
 
+/// Where a rule fired, for a chart to mark: the last moment of the bar it
+/// fired on — so a chart of any resolution puts it on the bar that holds
+/// that moment — and what to call it.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Marker {
+    pub ts: i64,
+    pub label: String,
+}
+
+/// Every bar `alert`'s rule fired on, over the cached history of its own
+/// timeframe. Nothing for a price alert, or a rule this build cannot read.
+pub fn markers_for(store: &Store, provider: &dyn Provider, instrument: &Instrument, alert: &Alert, now: i64) -> Vec<Marker> {
+    let Some(Ok(rule)) = alert.parsed_rule() else { return Vec::new() };
+    let Some(key) = crate::cli::cache_key(provider, instrument) else { return Vec::new() };
+    let timeframe = alert.rule_timeframe();
+    let bars = rule_bars(store, instrument, &key, timeframe, None, now);
+    let computed = rule.compute(&bars, &Inputs { session_origin: instrument.session_origin, timeframe });
+    let unfinished = forming(instrument, &bars, timeframe, now) && alert.on_close;
+    let label = match alert.name.is_empty() {
+        true => format!("#{}", alert.id),
+        false => alert.name.clone(),
+    };
+    rule.signals(&computed)
+        .into_iter()
+        .filter(|&i| !(unfinished && i + 1 == bars.len()))
+        .map(|i| Marker { ts: bars[i].ts + timeframe.seconds() - 1, label: label.clone() })
+        .collect()
+}
+
+/// The markers of every rule alert on a symbol that has not expired.
+pub fn markers(store: &Store, provider: &dyn Provider, instrument: &Instrument, now: i64) -> Vec<Marker> {
+    markers_except(store, provider, instrument, now, None)
+}
+
+/// The same, leaving out one alert: the one an editor is previewing.
+pub fn markers_except(
+    store: &Store,
+    provider: &dyn Provider,
+    instrument: &Instrument,
+    now: i64,
+    except: Option<i64>,
+) -> Vec<Marker> {
+    use omacharts_engine::alert::State;
+    store
+        .alerts()
+        .iter()
+        .filter(|a| Some(a.id) != except)
+        .filter(|a| a.is_rule() && a.state(now) != State::Expired)
+        .filter(|a| a.is_for(&instrument.symbol, instrument.suffix.as_deref()))
+        .flat_map(|a| markers_for(store, provider, instrument, a, now))
+        .collect()
+}
+
 /// Whether the newest of `bars` is still forming: inside its timeframe,
 /// and in a market that is trading.
 pub fn forming(instrument: &Instrument, bars: &[Bar], timeframe: Timeframe, now: i64) -> bool {

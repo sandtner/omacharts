@@ -260,6 +260,11 @@ struct State {
     risk: omacharts_engine::position::Risk,
     /// The prices of the armed alerts on this chart's symbol.
     alert_levels: Vec<f64>,
+    /// Where the rule alerts on this chart's symbol fired.
+    rule_markers: Vec<crate::alerts::Marker>,
+    /// Where a rule being edited would have fired, shown while its editor
+    /// is open.
+    preview_markers: Vec<crate::alerts::Marker>,
     /// What this chart shares its drawings with, which is also the scope a
     /// drawing made on it gets.
     /// Whether a drawing made here goes to the symbol or stays on this
@@ -1180,6 +1185,8 @@ impl State {
             configs: Configurations::default(),
             risk: omacharts_engine::position::Risk::default(),
             alert_levels: Vec::new(),
+            rule_markers: Vec::new(),
+            preview_markers: Vec::new(),
             sends: true,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -2853,6 +2860,28 @@ impl ChartView {
             return;
         }
         state.alert_levels = levels;
+        drop(state);
+        self.redraw();
+    }
+
+    /// Where the rule alerts on this chart's symbol fired.
+    pub fn set_rule_markers(&self, markers: Vec<crate::alerts::Marker>) {
+        let mut state = self.state.borrow_mut();
+        if state.rule_markers == markers {
+            return;
+        }
+        state.rule_markers = markers;
+        drop(state);
+        self.redraw();
+    }
+
+    /// Where a rule being edited would have fired; empty to stop showing it.
+    pub fn set_preview_markers(&self, markers: Vec<crate::alerts::Marker>) {
+        let mut state = self.state.borrow_mut();
+        if state.preview_markers == markers {
+            return;
+        }
+        state.preview_markers = markers;
         drop(state);
         self.redraw();
     }
@@ -4943,6 +4972,7 @@ fn draw(cr: &cairo::Context, width: f64, height: f64, state: &State) {
     cr.restore().ok();
     draw_drawings(cr, state, &plan, &scale);
     draw_alert_levels(cr, state, &plan, &scale);
+    draw_rule_markers(cr, state, &plan, &scale);
 
     for (at, row) in plan.rows.iter().enumerate() {
         draw_row_edge(cr, state, &plan, at);
@@ -6513,6 +6543,87 @@ fn draw_alert_levels(cr: &cairo::Context, state: &State, plan: &Layout, scale: &
         colors::set_source(cr, &state.theme.ui.background);
         cr.move_to(x + 5.0, y + 3.5);
         let _ = cr.show_text(&text);
+    }
+    cr.restore().ok();
+}
+
+/// Where a rule fired: a small amber triangle under the low of the bar
+/// holding that moment, pointing up at it, with the alert's name beneath
+/// while there is room for it. A rule being edited is drawn hollow, so a
+/// preview is never mistaken for an alert that is set. Several on one bar
+/// stack downwards.
+fn draw_rule_markers(cr: &cairo::Context, state: &State, plan: &Layout, scale: &PriceScale) {
+    if (state.rule_markers.is_empty() && state.preview_markers.is_empty()) || state.bars.is_empty() {
+        return;
+    }
+    let amber = omacharts_engine::Paint::preset(omacharts_engine::Preset::Amber).hex(&state.theme);
+    let (first, _, lead) = state.view();
+    let bar_w = plan.plot_w / state.columns().max(1) as f64;
+    let left = first as f64 - lead as f64;
+    let (lo_x, hi_x) = (plan.plot_x - bar_w, plan.plot_x + plan.plot_w + bar_w);
+    let size = (bar_w * 0.8).clamp(8.0, 11.0);
+    // Where each marker goes, left to right, so a label can give way to the
+    // one before it rather than print over it.
+    let mut placed: Vec<(f64, usize, &crate::alerts::Marker, bool)> = state
+        .rule_markers
+        .iter()
+        .map(|m| (m, false))
+        .chain(state.preview_markers.iter().map(|m| (m, true)))
+        .filter_map(|(marker, preview)| {
+            // The bar that holds the moment: the last that opened by then.
+            let at = state.bars.partition_point(|b| b.ts <= marker.ts).checked_sub(1)?;
+            let x = plan.plot_x + (at as f64 - left + 0.5) * bar_w;
+            (lo_x..=hi_x).contains(&x).then_some((x, at, marker, preview))
+        })
+        .collect();
+    placed.sort_by(|a, b| a.0.total_cmp(&b.0));
+    cr.save().ok();
+    cr.rectangle(plan.plot_x, plan.price_y, plan.plot_w, plan.price_h);
+    cr.clip();
+    cr.select_font_face("sans-serif", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
+    cr.set_font_size(10.0);
+    let mut stacked: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut label_end = f64::NEG_INFINITY;
+    let step = size + 14.0;
+    for (x, at, marker, preview) in placed {
+        let nth = stacked.entry(at).or_insert(0);
+        let top = scale.to_y(state.bars[at].low, plan.price_y, plan.price_h) + 6.0 + *nth as f64 * step;
+        *nth += 1;
+        cr.move_to(x, top);
+        cr.line_to(x + size / 2.0, top + size);
+        cr.line_to(x - size / 2.0, top + size);
+        cr.close_path();
+        match preview {
+            true => {
+                colors::set_source(cr, &state.theme.ui.background);
+                let _ = cr.fill_preserve();
+                colors::set_source(cr, &amber);
+                cr.set_line_width(1.5);
+                let _ = cr.stroke();
+            }
+            false => {
+                colors::set_source(cr, &amber);
+                let _ = cr.fill();
+            }
+        }
+        if marker.label.is_empty() {
+            continue;
+        }
+        let w = cr.text_extents(&marker.label).map(|e| e.x_advance()).unwrap_or(0.0);
+        let tx = (x - w / 2.0).round();
+        if tx < label_end + 4.0 {
+            continue;
+        }
+        label_end = tx + w;
+        // Ringed in the chart's own colour, so it reads over a band's
+        // shading or a neighbour's wick.
+        cr.move_to(tx, top + size + 11.0);
+        cr.text_path(&marker.label);
+        colors::set_source(cr, &state.theme.ui.background);
+        cr.set_line_width(3.0);
+        let _ = cr.stroke_preserve();
+        colors::set_source(cr, &amber);
+        let _ = cr.fill();
     }
     cr.restore().ok();
 }

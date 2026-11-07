@@ -7799,6 +7799,17 @@ mod tests {
         assert!(crate::alerts::check_quotes(&store, provider.as_ref(), &index, None).is_empty());
         assert!(words(&["alert", "log", "2"]).out.contains("#2 AAPL when close > sma(20) at 257.00"));
         assert!(crate::alerts::levels(&store, "AAPL", None) == vec![300.0], "a rule draws no level");
+        // It marks where it fired instead: once, on the day the closes went
+        // back over their 20-day average, at that day's last second.
+        let marks = crate::alerts::markers(&store, provider.as_ref(), &instrument, start + 61 * 86_400);
+        let rule = omacharts_engine::condition::Rule::parse("close > sma(20)").unwrap();
+        let inputs = omacharts_engine::condition::Inputs { session_origin: instrument.session_origin, timeframe: Timeframe::days(1) };
+        let crossed = rule.signals(&rule.compute(&bars, &inputs));
+        assert_eq!(crossed.len(), 1);
+        assert!(crossed[0] > 30, "on the way back up: {crossed:?}");
+        assert_eq!(marks.len(), 1, "{marks:?}");
+        assert_eq!(marks[0].label, "#2");
+        assert_eq!(marks[0].ts, bars[crossed[0]].ts + 86_399);
     }
 
     #[test]

@@ -976,6 +976,13 @@ widget's poll, at the rule's own timeframe. In the editor, choose "Rule
 over the bars" as the condition. It then shows whether the rule holds on
 the bars cached now, and on how many of them it fired.
 
+Every chart of the symbol marks where each rule alert fired with a small
+amber triangle under the bar, labelled with the alert's name or number.
+A rule on another timeframe is marked on the bar that holds the moment its
+own bar closed. While the editor is open, the rule being edited is shown
+as hollow triangles instead, and follows each change to it. Expired alerts
+leave no marks. `alert test` lists the same bars as text.
+
 ## Measuring a move
 
 With a window open, `chart measure` puts the ruler on the focused chart between

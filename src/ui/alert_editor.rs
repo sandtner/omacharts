@@ -345,10 +345,18 @@ pub fn present(window: &Rc<Window>, draft: Alert) {
                     if alert.is_rule() {
                         verdict.set_subtitle(&glib_escape(&evaluate(&window, &alert, last)));
                     }
+                    // The chart shows where it would have fired, hollow,
+                    // while the editor is open.
+                    let mut shown = alert.clone();
+                    if shown.name.is_empty() {
+                        shown.name = "?".into();
+                    }
+                    window.preview_rule(Some(&shown).filter(|a| a.is_rule()));
                 }
                 Err((_, why)) => {
                     preview.set_subtitle(&glib_escape(&why));
                     verdict.set_subtitle(&glib_escape(&why));
+                    window.preview_rule(None);
                 }
             }
         })
@@ -438,6 +446,10 @@ pub fn present(window: &Rc<Window>, draft: Alert) {
         cancel.connect_clicked(move |_| {
             dialog.close();
         });
+    }
+    {
+        let window = window.clone();
+        dialog.connect_closed(move |_| window.preview_rule(None));
     }
     dialogs::commit_on_ctrl_enter(&dialog, move || commit());
     dialog.present(Some(&window.window));
