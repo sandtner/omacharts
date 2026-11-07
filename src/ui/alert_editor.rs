@@ -11,7 +11,8 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use omacharts_engine::alert::{next_id, Alert, Condition, Frequency};
-use omacharts_engine::price_decimals;
+use omacharts_engine::condition::{Inputs, Rule};
+use omacharts_engine::{price_decimals, Timeframe};
 
 use crate::ui::dialogs;
 use crate::ui::window::Window;
@@ -52,11 +53,16 @@ pub fn present(window: &Rc<Window>, draft: Alert) {
     };
     let instrument = find(&draft.symbol, draft.suffix.as_deref());
     let kind = instrument.as_ref().map(|i| i.kind);
-    let decimals = price_decimals(0.0, draft.level, kind);
     let last = instrument
         .as_ref()
         .and_then(|i| crate::cli::quote(window.store(), window.provider().as_ref(), i))
         .map(|q| q.last);
+    // A rule has no level; its figures are written to the price's scale.
+    let scale = match draft.is_rule() {
+        true => last.unwrap_or(draft.scale()),
+        false => draft.level,
+    };
+    let decimals = price_decimals(0.0, scale, kind);
     let is_new = draft.id == 0;
     let on_line = draft.drawing;
 
@@ -78,10 +84,52 @@ pub fn present(window: &Rc<Window>, draft: Alert) {
         .collect();
     let condition = adw::ComboRow::new();
     condition.set_title("Condition");
-    let labels: Vec<&str> = conditions.iter().map(|c| c.label()).collect();
+    let mut labels: Vec<&str> = conditions.iter().map(|c| c.label()).collect();
+    // Last, after the price conditions: a rule over the bars, which a line
+    // has no use for.
+    let rule_choice = labels.len() as u32;
+    if on_line.is_none() {
+        labels.push("Rule over the bars");
+    }
     condition.set_model(Some(&gtk::StringList::new(&labels)));
-    condition.set_selected(conditions.iter().position(|c| *c == draft.condition).unwrap_or(0) as u32);
+    condition.set_selected(match draft.is_rule() {
+        true => rule_choice,
+        false => conditions.iter().position(|c| *c == draft.condition).unwrap_or(0) as u32,
+    });
     condition_group.add(&condition);
+    let is_rule = {
+        let condition = condition.clone();
+        move || on_line.is_none() && condition.selected() == rule_choice
+    };
+
+    // The rule, the bars it is read on, and whether the bar forming counts.
+    let rule = adw::EntryRow::new();
+    rule.set_title("Rule, such as sma(20) crosses_above sma(50)");
+    rule.set_text(draft.rule.as_deref().unwrap_or(""));
+    condition_group.add(&rule);
+    let mut timeframes: Vec<Timeframe> = Timeframe::PRESETS.to_vec();
+    if !timeframes.contains(&draft.rule_timeframe()) {
+        timeframes.push(draft.rule_timeframe());
+        timeframes.sort_by_key(|t| t.seconds());
+    }
+    let timeframe = adw::ComboRow::new();
+    timeframe.set_title("Bars");
+    let keys: Vec<String> = timeframes.iter().map(|t| t.key()).collect();
+    let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+    timeframe.set_model(Some(&gtk::StringList::new(&key_refs)));
+    timeframe.set_selected(timeframes.iter().position(|t| *t == draft.rule_timeframe()).unwrap_or(0) as u32);
+    condition_group.add(&timeframe);
+    let on_close = adw::SwitchRow::new();
+    on_close.set_title("Only on closed bars");
+    on_close.set_subtitle("Off: the bar still forming counts, and its indicators move with each price");
+    on_close.set_active(draft.on_close);
+    condition_group.add(&on_close);
+    // What the rule says about the bars cached now.
+    let verdict = adw::ActionRow::new();
+    verdict.set_title("Now");
+    verdict.add_css_class("property");
+    verdict.set_subtitle_lines(3);
+    condition_group.add(&verdict);
 
     let step = 10f64.powi(-(decimals as i32));
     let spin = |title: &str, value: f64| {
@@ -93,7 +141,13 @@ pub fn present(window: &Rc<Window>, draft: Alert) {
     };
     let (lo, hi) = draft.bounds();
     let channel_now = draft.condition.is_channel();
-    let level = spin("Price", if channel_now { lo } else { draft.level });
+    // A rule alert has no level of its own; turned back into a price
+    // alert, it starts from the last price.
+    let start = match draft.level > 0.0 {
+        true => draft.level,
+        false => last.map_or(0.0, |p| round(p, decimals)),
+    };
+    let level = spin("Price", if channel_now { lo } else { start });
     let upper = spin("Upper bound", draft.upper.map_or_else(|| suggest_upper(draft.level, last), |_| hi));
     if let Some(line) = on_line {
         level.set_sensitive(false);
@@ -145,7 +199,9 @@ pub fn present(window: &Rc<Window>, draft: Alert) {
     // -- What it says --------------------------------------------------------
     let message_group = adw::PreferencesGroup::new();
     message_group.set_title("Notification");
-    message_group.set_description(Some("In the message, {{ticker}}, {{price}} and {{level}} are filled in as it fires."));
+    message_group.set_description(Some(
+        "In the message, {{ticker}}, {{price}} and {{level}} are filled in as it fires, and {{value}} for a rule.",
+    ));
     let name = adw::EntryRow::new();
     name.set_title("Name");
     name.set_text(&draft.name);
@@ -188,6 +244,8 @@ pub fn present(window: &Rc<Window>, draft: Alert) {
     // What the rows say, as an alert: the draft with them put on it. An
     // error names the row it is about, so that row can be marked.
     let read = {
+        let (rule, timeframe, on_close, is_rule) = (rule.clone(), timeframe.clone(), on_close.clone(), is_rule.clone());
+        let timeframes = timeframes.clone();
         let (symbol, condition, level, upper, frequency, expires, expiry, name, note) = (
             symbol.clone(),
             condition.clone(),
@@ -217,15 +275,30 @@ pub fn present(window: &Rc<Window>, draft: Alert) {
                     alert.last = None;
                 }
             }
+            if is_rule() {
+                let text = rule.text();
+                let parsed = Rule::parse(&text).map_err(|e| (rule.clone().upcast::<gtk::Widget>(), e))?;
+                alert.rule = Some(parsed.to_string());
+                alert.timeframe = Some(timeframes.get(timeframe.selected() as usize).copied().unwrap_or(Timeframe::days(1)));
+                alert.on_close = on_close.is_active();
+                alert.upper = None;
+                alert.last = None;
+            } else {
+                alert.rule = None;
+                alert.timeframe = None;
+                alert.on_close = false;
+            }
             alert.condition = conditions.get(condition.selected() as usize).copied().unwrap_or(Condition::Cross);
-            if on_line.is_none() {
+            if on_line.is_none() && !alert.is_rule() {
                 alert.level = level.value();
                 if alert.level <= 0.0 {
                     return Err((level.clone().upcast(), "A price is more than zero".into()));
                 }
             }
-            alert.upper = None;
-            if alert.condition.is_channel() {
+            if !alert.is_rule() {
+                alert.upper = None;
+            }
+            if alert.condition.is_channel() && !alert.is_rule() {
                 let other = upper.value();
                 if other <= 0.0 || other == alert.level {
                     return Err((upper.clone().upcast(), "A channel needs two different prices".into()));
@@ -249,10 +322,19 @@ pub fn present(window: &Rc<Window>, draft: Alert) {
     let sync: Rc<dyn Fn()> = {
         let (condition, level, upper, preview, read) =
             (condition.clone(), level.clone(), upper.clone(), preview.clone(), read.clone());
+        let (rule, timeframe, on_close, verdict, now_row, is_rule) =
+            (rule.clone(), timeframe.clone(), on_close.clone(), verdict.clone(), now_row.clone(), is_rule.clone());
         let conditions = conditions.clone();
+        let window = window.clone();
         Rc::new(move || {
+            let ruled = is_rule();
             let chosen = conditions.get(condition.selected() as usize).copied().unwrap_or(Condition::Cross);
-            upper.set_visible(chosen.is_channel());
+            upper.set_visible(!ruled && chosen.is_channel());
+            level.set_visible(!ruled);
+            now_row.set_visible(!ruled);
+            for row in [rule.upcast_ref::<gtk::Widget>(), timeframe.upcast_ref(), on_close.upcast_ref(), verdict.upcast_ref()] {
+                row.set_visible(ruled);
+            }
             if on_line.is_none() {
                 level.set_title(if chosen.is_channel() { "Lower bound" } else { "Price" });
             }
@@ -260,20 +342,30 @@ pub fn present(window: &Rc<Window>, draft: Alert) {
                 Ok(alert) => {
                     let price = last.unwrap_or(alert.level);
                     preview.set_subtitle(&glib_escape(&preview_text(&alert, price, decimals)));
+                    if alert.is_rule() {
+                        verdict.set_subtitle(&glib_escape(&evaluate(&window, &alert, last)));
+                    }
                 }
-                Err((_, why)) => preview.set_subtitle(&glib_escape(&why)),
+                Err((_, why)) => {
+                    preview.set_subtitle(&glib_escape(&why));
+                    verdict.set_subtitle(&glib_escape(&why));
+                }
             }
         })
     };
+    for combo in [&condition, &timeframe] {
+        let sync = sync.clone();
+        combo.connect_selected_notify(move |_| sync());
+    }
     {
         let sync = sync.clone();
-        condition.connect_selected_notify(move |_| sync());
+        on_close.connect_active_notify(move |_| sync());
     }
     for spin in [&level, &upper] {
         let sync = sync.clone();
         spin.connect_value_notify(move |_| sync());
     }
-    for entry in [&symbol, &name, &note, &expiry] {
+    for entry in [&symbol, &rule, &name, &note, &expiry] {
         let sync = sync.clone();
         entry.connect_changed(move |_| sync());
     }
@@ -283,8 +375,13 @@ pub fn present(window: &Rc<Window>, draft: Alert) {
         let window = window.clone();
         let dialog = dialog.clone();
         let read = read.clone();
-        let rows: Vec<gtk::Widget> =
-            vec![symbol.clone().upcast(), level.clone().upcast(), upper.clone().upcast(), expiry.clone().upcast()];
+        let rows: Vec<gtk::Widget> = vec![
+            symbol.clone().upcast(),
+            level.clone().upcast(),
+            upper.clone().upcast(),
+            rule.clone().upcast(),
+            expiry.clone().upcast(),
+        ];
         Rc::new(move || {
             for row in &rows {
                 row.remove_css_class("error");
@@ -299,8 +396,8 @@ pub fn present(window: &Rc<Window>, draft: Alert) {
             };
             let store = window.store();
             let mut alerts = store.alerts();
-            alert.fired = None;
-            if alert.last.is_none() {
+            alert.restart();
+            if alert.last.is_none() && !alert.is_rule() {
                 alert.last = window
                     .symbols()
                     .and_then(|i| i.find(&alert.symbol, alert.suffix.as_deref()).cloned())
@@ -321,6 +418,13 @@ pub fn present(window: &Rc<Window>, draft: Alert) {
                 }
             }
             store.set_alerts(&alerts);
+            // The bars a rule reads, fetched now rather than at the next
+            // poll, so it is checked from the first reply.
+            let now = chrono::Utc::now().timestamp();
+            if let Some(index) = window.symbols() {
+                let series = crate::alerts::series_due(store, window.provider().as_ref(), &index, now);
+                window.warm_series(&series);
+            }
             window.refresh_alert_levels();
             dialog.close();
         })
@@ -339,6 +443,8 @@ pub fn present(window: &Rc<Window>, draft: Alert) {
     dialog.present(Some(&window.window));
     if on_line.is_none() && is_new {
         level.grab_focus();
+    } else if draft.is_rule() {
+        rule.grab_focus();
     }
 }
 
@@ -364,12 +470,15 @@ fn glib_escape(text: &str) -> String {
 /// What the notification will say when it fires, with the last price
 /// standing in for the one that will fire it.
 fn preview_text(alert: &Alert, price: f64, decimals: usize) -> String {
-    let what = format!(
-        "{} {} {}",
-        alert.spell_symbol(),
-        alert.condition.label().to_lowercase(),
-        alert.spell_level(decimals)
-    );
+    let what = match &alert.rule {
+        Some(rule) => format!("{} {rule} ({})", alert.spell_symbol(), alert.rule_timeframe().key()),
+        None => format!(
+            "{} {} {}",
+            alert.spell_symbol(),
+            alert.condition.label().to_lowercase(),
+            alert.spell_level(decimals)
+        ),
+    };
     let title = match alert.name.is_empty() {
         true => what,
         false => format!("{}: {what}", alert.name),
@@ -380,4 +489,48 @@ fn preview_text(alert: &Alert, price: f64, decimals: usize) -> String {
         false => format!("now {price:.decimals$} · {message}"),
     };
     format!("{title}\n{body}")
+}
+
+/// What a rule alert's rule says about the bars cached now: whether it
+/// holds on the bar it would be asked about, and the values it compares.
+fn evaluate(window: &Rc<Window>, alert: &Alert, last: Option<f64>) -> String {
+    let Some(Ok(rule)) = alert.parsed_rule() else { return String::new() };
+    let Some(instrument) = window.symbols().and_then(|i| i.find(&alert.symbol, alert.suffix.as_deref()).cloned())
+    else {
+        return String::new();
+    };
+    let provider = window.provider();
+    let Some(key) = crate::cli::cache_key(provider.as_ref(), &instrument) else {
+        return format!("{} does not serve {}", provider.id(), alert.spell_symbol());
+    };
+    let timeframe = alert.rule_timeframe();
+    let now = chrono::Utc::now().timestamp();
+    let bars = crate::alerts::rule_bars(window.store(), &instrument, &key, timeframe, last, now);
+    if bars.is_empty() {
+        window.warm_series(&[(instrument, timeframe.native())]);
+        return format!("No {} bars cached yet; they are fetched now, and the alert is checked once they land", timeframe.key());
+    }
+    let inputs = Inputs { session_origin: instrument.session_origin, timeframe };
+    let computed = rule.compute(&bars, &inputs);
+    let forming = crate::alerts::forming(&instrument, &bars, timeframe, now);
+    let at = match alert.on_close && forming {
+        true => bars.len().saturating_sub(2),
+        false => bars.len() - 1,
+    };
+    let decimals = price_decimals(0.0, bars[at].close, Some(instrument.kind));
+    let figures: Vec<String> = computed
+        .values_at(at)
+        .into_iter()
+        .map(|(s, v)| match v {
+            Some(v) => format!("{s} {v:.decimals$}"),
+            None => format!("{s} —"),
+        })
+        .collect();
+    let verdict = match (rule.holds(&computed, at), bars.len() < rule.warm_up()) {
+        (_, true) => format!("Needs {} bars, {} cached", rule.warm_up(), bars.len()),
+        (true, _) => "Holds now".to_string(),
+        (false, _) => "Does not hold now".to_string(),
+    };
+    let signals = rule.signals(&computed).len();
+    format!("{verdict} · {}\nFired on {signals} of the {} cached bars", figures.join(" · "), bars.len())
 }

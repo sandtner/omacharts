@@ -217,7 +217,15 @@ fn matches(filter: Filter, alert: &Alert, now: i64) -> bool {
 }
 
 fn searchable(alert: &Alert) -> String {
-    format!("{} {} {} {}", alert.spell_symbol(), alert.name, alert.note, alert.condition.label()).to_lowercase()
+    format!(
+        "{} {} {} {} {}",
+        alert.spell_symbol(),
+        alert.name,
+        alert.note,
+        alert.spell_condition(),
+        alert.rule.as_deref().unwrap_or("")
+    )
+    .to_lowercase()
 }
 
 fn clear_menu() -> gtk::gio::Menu {
@@ -302,8 +310,10 @@ fn table(window: &Rc<Window>, dialog: &adw::Dialog, all: &[Alert], alerts: &[&Al
                 .and_then(|i| crate::cli::quote(window.store(), provider.as_ref(), i))
                 .map(|q| q.last)
                 .or(alert.last);
-            let decimals = price_decimals(0.0, level, instrument.map(|i| i.kind));
-            (*alert, last, decimals, distance(alert, level, last))
+            let scale = if alert.is_rule() { last.unwrap_or(alert.scale()) } else { level };
+            let decimals = price_decimals(0.0, scale, instrument.map(|i| i.kind));
+            let away = if alert.is_rule() { None } else { distance(alert, level, last) };
+            (*alert, last, decimals, away)
         })
         .collect();
     let rank = |s: State| match s {
@@ -377,9 +387,16 @@ fn table(window: &Rc<Window>, dialog: &adw::Dialog, all: &[Alert], alerts: &[&Al
         let what = gtk::Box::new(gtk::Orientation::Vertical, 0);
         what.set_valign(gtk::Align::Center);
         what.set_hexpand(true);
-        let condition = match alert.drawing {
-            Some(line) => format!("{} · line #{line}", alert.condition.label()),
-            None => alert.condition.label().to_string(),
+        // A rule is what it fires on, so it stands where a condition does,
+        // with the bars it is read on after it.
+        let condition = match (&alert.rule, alert.drawing) {
+            (Some(rule), _) => format!(
+                "{rule} · {}{}",
+                alert.rule_timeframe().key(),
+                if alert.on_close { ", bar close" } else { "" }
+            ),
+            (None, Some(line)) => format!("{} · line #{line}", alert.condition.label()),
+            (None, None) => alert.spell_condition(),
         };
         let (top, bottom) = match alert.name.is_empty() {
             true => (condition, (!alert.note.is_empty()).then(|| alert.note.clone())),
@@ -400,12 +417,15 @@ fn table(window: &Rc<Window>, dialog: &adw::Dialog, all: &[Alert], alerts: &[&Al
             second.set_max_width_chars(28);
             what.append(&second);
         }
-        if !alert.note.is_empty() {
-            what.set_tooltip_text(Some(&alert.note));
+        match (&alert.rule, alert.note.is_empty()) {
+            (_, false) => what.set_tooltip_text(Some(&alert.note)),
+            (Some(rule), true) => what.set_tooltip_text(Some(rule)),
+            (None, true) => {}
         }
         grid.attach(&what, 2, row, 1, 1);
 
         let level_text = match alert.condition.is_channel() {
+            _ if alert.is_rule() => "—".to_string(),
             true => {
                 let (lo, hi) = alert.bounds();
                 format!("{} – {}", price(lo), price(hi))
@@ -413,6 +433,7 @@ fn table(window: &Rc<Window>, dialog: &adw::Dialog, all: &[Alert], alerts: &[&Al
             false => price(level),
         };
         let away = match (away, alert.condition.is_channel()) {
+            _ if alert.is_rule() => "—".to_string(),
             (Some(0.0), true) => "inside".to_string(),
             (Some(d), _) => format!("{d:+.2}%"),
             (None, _) => "—".into(),
@@ -441,6 +462,7 @@ fn table(window: &Rc<Window>, dialog: &adw::Dialog, all: &[Alert], alerts: &[&Al
             if numeric(column) {
                 label.add_css_class("numeric");
             }
+
             if column == 8 {
                 match state {
                     State::Fired => label.add_css_class("warning"),
@@ -521,10 +543,10 @@ fn log_table(window: &Rc<Window>, alerts: &[Alert]) -> gtk::Widget {
     let index = window.symbols();
     for (n, (alert, hit)) in hits.iter().enumerate() {
         let kind = index.as_ref().and_then(|i| i.find(&alert.symbol, alert.suffix.as_deref())).map(|i| i.kind);
-        let decimals = price_decimals(0.0, alert.level, kind);
+        let decimals = price_decimals(0.0, alert.scale(), kind);
         let name = match alert.name.is_empty() {
-            true => format!("#{} {}", alert.id, alert.condition.label()),
-            false => format!("#{} {} · {}", alert.id, alert.name, alert.condition.label()),
+            true => format!("#{} {}", alert.id, alert.spell_condition()),
+            false => format!("#{} {} · {}", alert.id, alert.name, alert.spell_condition()),
         };
         let cells = [
             when(hit.at),

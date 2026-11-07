@@ -846,10 +846,11 @@ entry, then the target. Drag the grip on the stop to move it, and drag the
 grip on the right end to change how far out the position runs. Its
 properties dialog edits the three prices and the account.
 
-## Price alerts
+## Price and indicator alerts
 
 An alert is a condition on a symbol and a desktop notification when the
-price meets it. With no symbol, the alert goes on the focused chart's
+price meets it, or when a rule over the symbol's bars holds (see
+[Rules over the bars](#rules-over-the-bars) below). With no symbol, the alert goes on the focused chart's
 symbol. Give one condition:
 
 | Flag | Fires when the price… |
@@ -862,6 +863,7 @@ symbol. Give one condition:
 | `--enter LOW,HIGH` | moves into the channel |
 | `--exit LOW,HIGH` | moves out of the channel |
 | `--drawing ID` | crosses a shared horizontal line, wherever it is moved |
+| `--when RULE` | — a rule over the bars holds instead, such as `"sma(20) crosses_above sma(50)"` |
 
 Each alert also has:
 
@@ -872,7 +874,8 @@ Each alert also has:
   `2026-12-31T16:00` in local time;
 - `--name`, which goes at the front of the notification's title;
 - `--note`, the message. `{{ticker}}`, `{{price}}` and `{{level}}` in it are
-  filled in when the alert fires.
+  filled in when the alert fires. For a rule, `{{level}}` is the rule and
+  `{{value}}` is the first indicator it compares.
 
 ```sh
 omacharts alert add AAPL --cross-up 250 --name Breakout --trigger every --expires 2w
@@ -911,7 +914,67 @@ poll for them:
 So with the window closed, an alert depends on the bar widget being
 installed (`omacharts plugin install`). Without the widget, run
 `omacharts alert check` from a timer of your own. Armed alerts are drawn on
-their charts as dotted amber lines, two for a channel.
+their charts as dotted amber lines, two for a channel. A rule has no level,
+so it draws no line.
+
+### Rules over the bars
+
+A rule compares series computed over a symbol's bars, with the same
+functions the chart draws its indicators with. It is read on daily bars
+unless `--timeframe` says otherwise.
+
+```text
+rule    := all ("or" all)*            and binds tighter than or; no brackets
+all     := clause ("and" clause)*
+clause  := operand comparison operand
+operand := a number, or a series
+```
+
+| Series | Means |
+| --- | --- |
+| `close` (or `price`), `open`, `high`, `low`, `volume` | the bar's own figures |
+| `sma(n)`, `ema(n)` | simple and exponential moving averages of the close |
+| `rsi(n)`, `atr(n)` | n defaults to 14 |
+| `macd(fast,slow,signal)`, `.signal`, `.hist` | 12, 26, 9 by default; the line itself without a part |
+| `stoch(n,k,d)`, `.d` | 14, 3, 3 by default; %K without a part |
+| `bb(n,dev)`, `.upper`, `.lower` | Bollinger bands, 20 and 2 by default; the basis without a part |
+| `vwap`, `vwap(dev).upper`, `vwap(dev).lower` | reset each session |
+
+| Comparison | Holds on a bar when the left side… |
+| --- | --- |
+| `crosses_above` (`crosses above`, `crossover`) | is above the right now, and was at or below it on the bar before |
+| `crosses_below` (`crosses below`, `crossunder`) | is below now, and was at or above it before |
+| `crosses` | does either |
+| `>`, `<`, `>=`, `<=` (`above`, `below`) | compares so on this bar |
+
+A rule is asked about the newest bar. By default that is the bar still
+forming, so it is checked as prices arrive. With `--evaluate close`, only
+bars that have closed count, which is what a crossing that has to hold
+until the close wants. A rule fires at most once a bar. With
+`--trigger every`, a rule with a place in it (`rsi(14) > 70`) fires each
+time it starts to hold, not on every bar it stays true. A series with too
+little history has no value yet, and a clause that reads it does not hold.
+
+`alert test` reads a rule without setting anything. It says whether the
+rule holds now, gives the values it compares, and lists the bars it fired
+on across the cached history. It fetches the bars when none are cached:
+
+```sh
+omacharts alert test "sma(20) crosses_above sma(50)" SPY
+# SPY 1D · sma(20) crosses_above sma(50)
+# latest bar 2026-11-06 (closed), close 735.29: does not hold
+#   sma(20) 763.36 · sma(50) 765.68
+# fired on 51 of 5000 bars since 2006-12-21, latest 10: …
+omacharts alert test "macd crosses_above macd.signal and close > ema(200)" NVDA --timeframe 1h --json
+omacharts alert add SPY --when "close < sma(20)" --name "Below trend" --note "{{ticker}} at {{price}}, sma {{value}}"
+omacharts alert add NVDA --when "rsi(14) crosses_below 30" --timeframe 1h --evaluate close --trigger every
+omacharts alert edit 5 --timeframe 4h      # or --when to change the rule, or --above to make it a price alert again
+```
+
+The bars a rule reads are fetched along with the quotes on the bar
+widget's poll, at the rule's own timeframe. In the editor, choose "Rule
+over the bars" as the condition. It then shows whether the rule holds on
+the bars cached now, and on how many of them it fired.
 
 ## Measuring a move
 
@@ -1459,7 +1522,7 @@ story, and adding a manifest would be a second thing to maintain for nothing.
 | `chartbook` | saved arrangements of charts |
 | `chart` | the charts inside a chartbook |
 | `template` | chart templates: named sets of indicators that charts share |
-| `alert` | price alerts, as desktop notifications |
+| `alert` | price and indicator alerts, as desktop notifications; `alert test` reads a rule over the bars |
 | `provider` | the data feed, and signing in to one that needs it |
 | `config` | stored preferences |
 | `cache` | the cached market data |

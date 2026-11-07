@@ -6179,6 +6179,19 @@ impl Window {
         }
     }
 
+    /// Queue the bar series rule alerts read. Their replies land as any
+    /// chart's do, and check the alerts on the way in.
+    pub fn warm_series(self: &Rc<Self>, series: &[(Instrument, Timeframe)]) {
+        for (rank, (instrument, timeframe)) in series.iter().enumerate() {
+            let Some(symbol) = self.provider().symbol_for(instrument) else { continue };
+            let key = format!("{}:{symbol}", self.provider().id());
+            self.loader().fetch(
+                Request { key, symbol, timeframe: *timeframe, speculative: true },
+                BACKFILL.saturating_add(rank as u32),
+            );
+        }
+    }
+
     /// Queue batches of closes for the bar widget, on this window's loader so
     /// that they share its pacing and its cooldown with everything else.
     pub fn warm_closes(self: &Rc<Self>, batches: Vec<Vec<crate::loader::Listing>>) {

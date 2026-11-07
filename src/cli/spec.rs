@@ -339,9 +339,13 @@ macro_rules! alert_flags {
             Flag::valued("cross-down", "PRICE", "fire when the price goes down through this"),
             Flag::valued("enter", "LOW,HIGH", "fire when the price moves into this channel"),
             Flag::valued("exit", "LOW,HIGH", "fire when the price moves out of this channel"),
+            Flag::valued("when", "RULE", "fire on a rule over the bars instead of a price, such as \"sma(20) crosses_above sma(50)\" or \"rsi(14) < 30 and close > ema(200)\"; see `alert test`"),
+            Flag::valued("timeframe", "TF", "the bars a rule is read on, such as 15m, 1h, 4h, 1D (default) or 1W"),
+            Flag::valued("evaluate", "WHEN", "tick: ask about the bar still forming, as prices arrive (default); close: only about bars that have closed")
+                .of(&["tick", "close"]),
             $($own,)*
             Flag::valued("name", "WORDS", "what the alert is called, in the list and the notification's title"),
-            Flag::valued("note", "WORDS", "the message after the price; {{ticker}}, {{price}} and {{level}} are filled in"),
+            Flag::valued("note", "WORDS", "the message after the price; {{ticker}}, {{price}} and {{level}} are filled in, and {{value}} for a rule"),
             Flag::valued("trigger", "WHEN", "once: fire and wait to be rearmed (default); every: fire each time it happens")
                 .of(&["once", "every"]),
             Flag::valued("expires", "WHEN", "stop after 90m, 12h, 3d, 2w, a date such as 2026-12-31, a time such as 2026-12-31T16:00, or never"),
@@ -1179,7 +1183,7 @@ pub const SURFACE: &[Noun] = &[
     },
     Noun {
         name: "alert",
-        about: "Price alerts: a desktop notification when a symbol reaches a level or a channel, checked by the bar widget's poll and by live charts",
+        about: "Price and indicator alerts: a desktop notification when a symbol reaches a level or a channel, or a rule over its bars holds, checked by the bar widget's poll and by live charts",
         local: false,
         verbs: &[
             Verb {
@@ -1195,7 +1199,7 @@ pub const SURFACE: &[Noun] = &[
             },
             Verb {
                 name: "add",
-                about: "Set an alert on a symbol (default: the focused chart's), at a price, on a channel or on a horizontal line",
+                about: "Set an alert on a symbol (default: the focused chart's), at a price, on a channel, on a horizontal line or on a rule over its bars",
                 args: &[Arg::opt("SYMBOL", "the instrument, such as AAPL or NESN.SW (default: the focused chart's)")],
                 flags: ALERT_ADD_FLAGS,
                 example: "omacharts alert add AAPL --cross-up 250 --trigger every --expires 2w --name Breakout",
@@ -1205,7 +1209,7 @@ pub const SURFACE: &[Noun] = &[
             },
             Verb {
                 name: "edit",
-                about: "Change an alert: its condition, level, symbol, name, message, trigger or expiry; saving arms it again",
+                about: "Change an alert: its condition, level or rule, symbol, name, message, trigger or expiry; saving arms it again",
                 args: &[Arg::req("ID", "the alert, from `alert list`")],
                 flags: ALERT_EDIT_FLAGS,
                 example: "omacharts alert edit 3 --enter 190,200 --trigger every --expires 3d",
@@ -1284,6 +1288,24 @@ pub const SURFACE: &[Noun] = &[
                 example: "omacharts alert log 3",
                 json: true,
                 writes: true,
+                workspace: false,
+            },
+            Verb {
+                name: "test",
+                about: "Read a rule over a symbol's bars without setting an alert: whether it holds now, the values it compares, and the bars it fired on",
+                args: &[
+                    Arg::req("RULE", "the rule, quoted, such as \"sma(20) crosses_above sma(50)\"; series: close, open, high, low, volume, sma(n), ema(n), rsi(n), atr(n), macd(f,s,sig)[.signal|.hist], stoch(n,k,d)[.d], bb(n,dev)[.upper|.lower], vwap[(dev).upper|.lower]; comparisons: crosses_above, crosses_below, crosses, >, <, >=, <=; joined by and, or"),
+                    Arg::opt("SYMBOL", "the instrument (default: the focused chart's)"),
+                ],
+                flags: &[
+                    Flag::valued("timeframe", "TF", "the bars to read it on (default: 1D)"),
+                    Flag::valued("evaluate", "WHEN", "tick: the bar still forming counts (default); close: only bars that have closed")
+                        .of(&["tick", "close"]),
+                    Flag::valued("signals", "N", "how many of the latest bars it fired on to list (default: 10)"),
+                ],
+                example: "omacharts alert test \"rsi(14)<30\" SPY --timeframe 1D",
+                json: true,
+                writes: false,
                 workspace: false,
             },
             Verb {

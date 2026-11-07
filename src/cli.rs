@@ -286,6 +286,9 @@ pub trait Live {
     /// Queue batches of closes on the window's loader, the same bargain as
     /// [`Self::warm`] for the rows a batch can cover.
     fn warm_closes(&self, batches: Vec<Vec<Listing>>);
+    /// Queue the bar series rule alerts read, on the window's loader, the
+    /// same bargain as [`Self::warm`]. Nothing to do without a window.
+    fn warm_series(&self, _series: &[(Instrument, Timeframe)]) {}
     /// The window's symbol index, if it already names every listing.
     ///
     /// Same bargain as `warm`: the window has spent the milliseconds once, so
@@ -605,6 +608,9 @@ pub struct Refresh {
     pub bars: Vec<Instrument>,
     /// The rest, one request per batch, when any of them is due.
     pub closes: Vec<Vec<Listing>>,
+    /// The bar series rule alerts read, at the timeframe each is fetched
+    /// at: see [`crate::alerts::series_due`].
+    pub series: Vec<(Instrument, Timeframe)>,
 }
 
 /// Whether a row with something cached is worth asking about again.
@@ -711,6 +717,7 @@ pub fn plan_refresh(
     let mut plan = Refresh {
         bars: bars.into_iter().take(MAX_REFRESH).map(|(_, i)| i.clone()).collect(),
         closes: Vec::new(),
+        series: Vec::new(),
     };
     if any_due {
         batchable.sort_by_key(|(fetched_at, _)| *fetched_at);
@@ -748,6 +755,14 @@ fn refresh(store: &Store, provider: &dyn Provider, plan: Refresh) {
         loader.fetch(request, BACKFILL.saturating_add(1 + rank as u32));
         outstanding += 1;
     }
+    // The series rule alerts read, at their own timeframes.
+    for (rank, (instrument, timeframe)) in plan.series.iter().enumerate() {
+        let Some(symbol) = provider.symbol_for(instrument) else { continue };
+        let Some(key) = cache_key(provider, instrument) else { continue };
+        let request = Request { key, symbol, timeframe: *timeframe, speculative: true };
+        loader.fetch(request, BACKFILL.saturating_add(1 + (plan.bars.len() + rank) as u32));
+        outstanding += 1;
+    }
     // The loader writes whatever arrives to the cache itself. All that is
     // left is to wait until it has.
     for _ in 0..outstanding {
@@ -755,6 +770,12 @@ fn refresh(store: &Store, provider: &dyn Provider, plan: Refresh) {
             break;
         }
     }
+}
+
+/// Fetch bar series here and now, with no window: what `alert test` reads
+/// when nothing, or nothing recent, is cached.
+pub fn refresh_series(store: &Store, provider: &dyn Provider, series: &[(Instrument, Timeframe)]) {
+    refresh(store, provider, Refresh { series: series.to_vec(), ..Refresh::default() });
 }
 
 /// Fetch what is due for the alerts' symbols and check them.
@@ -767,11 +788,13 @@ pub fn check_alerts(store: &Store, live: Option<&dyn Live>) -> Vec<omacharts_eng
     let provider = crate::feeds::selected(store);
     let instruments = crate::alerts::instruments(store, &index);
     let now = chrono::Utc::now().timestamp();
-    let plan = plan_refresh(store, provider.as_ref(), &instruments, now, MAX_BATCHES);
+    let mut plan = plan_refresh(store, provider.as_ref(), &instruments, now, MAX_BATCHES);
+    plan.series = crate::alerts::series_due(store, provider.as_ref(), &index, now);
     match live {
         Some(live) => {
             live.warm(&plan.bars);
             live.warm_closes(plan.closes);
+            live.warm_series(&plan.series);
             Vec::new()
         }
         None => {
@@ -798,7 +821,8 @@ pub fn watchlist_json(store: &Store, refresh_first: bool, live: Option<&dyn Live
             .collect();
         instruments.extend(crate::alerts::instruments(store, &index));
         let now = chrono::Utc::now().timestamp();
-        let plan = plan_refresh(store, provider.as_ref(), &instruments, now, MAX_BATCHES);
+        let mut plan = plan_refresh(store, provider.as_ref(), &instruments, now, MAX_BATCHES);
+        plan.series = crate::alerts::series_due(store, provider.as_ref(), &index, now);
         match live {
             // Inside the window, on its main loop. Hand the work to the
             // loader thread and answer from the cache, which is all the
@@ -807,6 +831,7 @@ pub fn watchlist_json(store: &Store, refresh_first: bool, live: Option<&dyn Live
             Some(live) => {
                 live.warm(&plan.bars);
                 live.warm_closes(plan.closes);
+                live.warm_series(&plan.series);
             }
             // A process of its own, with no window and nothing to block —
             // and nobody else to check the alerts once the prices are in.
@@ -1064,6 +1089,10 @@ impl Live for Rc<crate::ui::Window> {
 
     fn warm_closes(&self, batches: Vec<Vec<Listing>>) {
         crate::ui::Window::warm_closes(self, batches);
+    }
+
+    fn warm_series(&self, series: &[(Instrument, Timeframe)]) {
+        crate::ui::Window::warm_series(self, series);
     }
 
     fn symbols(&self) -> Option<Rc<SearchIndex>> {

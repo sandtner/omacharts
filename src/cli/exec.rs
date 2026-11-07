@@ -170,6 +170,7 @@ pub fn dispatch(
         }
 
         ("alert", "list") => alert_list(store, m, json),
+        ("alert", "test") => alert_test(store, m, json, live),
         ("alert", _) => {
             let outcome = match verb {
                 "add" => alert_add(store, m, json, live.is_some()),
@@ -4503,7 +4504,7 @@ fn alert_symbol(text: &str) -> Result<(String, Option<String>), Fault> {
 /// How many decimals a level on a symbol is written to.
 fn alert_decimals(alert: &omacharts_engine::alert::Alert) -> usize {
     let kind = crate::inventory::everything().find(&alert.symbol, alert.suffix.as_deref()).map(|i| i.kind);
-    omacharts_engine::price_decimals(0.0, alert.level, kind)
+    omacharts_engine::price_decimals(0.0, alert.scale(), kind)
 }
 
 fn alert_now() -> i64 {
@@ -4606,6 +4607,206 @@ fn alert_last_price(store: &Store, alert: &omacharts_engine::alert::Alert) -> Op
     super::quote(store, provider.as_ref(), instrument).map(|q| q.last)
 }
 
+/// The symbol named, or the focused chart's.
+fn alert_target(store: &Store, m: &clap::ArgMatches, window: bool) -> Result<(String, Option<String>), Fault> {
+    if let Some(text) = arg(m, "SYMBOL") {
+        return alert_symbol(text);
+    }
+    if !window {
+        return Err(Fault::no_window("focused chart"));
+    }
+    let workspace = Workspace::load(store);
+    let at = workspace.resolve(None)?;
+    let book = workspace.book(at)?.clone();
+    let pane = charts::resolve_pane(&book, None)?;
+    let chart =
+        charts::panes(&book).iter().find(|p| p["id"].as_u64() == Some(pane as u64)).cloned().unwrap_or_default();
+    let symbol = chart["symbol"].as_str().unwrap_or("").to_string();
+    if symbol.is_empty() {
+        return Err(Fault::refused("the focused chart has no symbol".into()));
+    }
+    let suffix = chart["suffix"].as_str().filter(|s| !s.is_empty()).map(str::to_string);
+    Ok((symbol, suffix))
+}
+
+/// The rule given with --when, read.
+fn alert_rule(m: &clap::ArgMatches) -> Result<Option<omacharts_engine::condition::Rule>, Fault> {
+    arg(m, "when")
+        .map(|text| omacharts_engine::condition::Rule::parse(text).map_err(|e| Fault::usage(format!("--when: {e}"))))
+        .transpose()
+}
+
+/// The bars to read a rule on, from --timeframe.
+fn alert_timeframe(m: &clap::ArgMatches) -> Result<Option<Timeframe>, Fault> {
+    arg(m, "timeframe")
+        .map(|text| {
+            Timeframe::parse(text)
+                .ok_or_else(|| Fault::usage(format!("--timeframe is a resolution such as 15m, 1h, 4h, 1D or 1W, not {text:?}")))
+        })
+        .transpose()
+}
+
+/// --evaluate: whether only closed bars count.
+fn alert_on_close(m: &clap::ArgMatches) -> Result<Option<bool>, Fault> {
+    match arg(m, "evaluate").map(String::as_str) {
+        None => Ok(None),
+        Some("close") => Ok(Some(true)),
+        Some("tick") => Ok(Some(false)),
+        Some(other) => Err(Fault::usage(format!("--evaluate is tick or close, not {other:?}"))),
+    }
+}
+
+/// Timeframe and evaluation onto a rule alert, from whichever were given.
+fn alert_rule_settings(m: &clap::ArgMatches, alert: &mut omacharts_engine::alert::Alert) -> Result<(), Fault> {
+    if let Some(timeframe) = alert_timeframe(m)? {
+        alert.timeframe = Some(timeframe);
+    }
+    if let Some(on_close) = alert_on_close(m)? {
+        alert.on_close = on_close;
+    }
+    Ok(())
+}
+
+/// Read a rule over a symbol's bars, and say what it finds.
+fn alert_test(store: &Store, m: &clap::ArgMatches, as_json: bool, live: Option<&dyn Live>) -> Result<String, Fault> {
+    use omacharts_engine::condition::{Inputs, Rule};
+    let text = required(m, "RULE")?;
+    let rule = Rule::parse(text).map_err(Fault::usage)?;
+    let timeframe = alert_timeframe(m)?.unwrap_or(Timeframe::days(1));
+    let on_close = alert_on_close(m)?.unwrap_or(false);
+    let shown = match arg(m, "signals") {
+        None => 10,
+        Some(n) => n
+            .parse::<usize>()
+            .map_err(|_| Fault::usage(format!("--signals is a count of bars, not {n:?}")))?,
+    };
+    let (symbol, suffix) = alert_target(store, m, live.is_some())?;
+    let index = crate::inventory::everything();
+    let instrument = index
+        .find(&symbol, suffix.as_deref())
+        .cloned()
+        .ok_or_else(|| Fault::not_found(format!("{symbol} is not an instrument this app knows")))?;
+    let provider = crate::feeds::selected(store);
+    let key = super::cache_key(provider.as_ref(), &instrument)
+        .ok_or_else(|| Fault::refused(format!("{} does not serve {symbol}", provider.id())))?;
+    let now = alert_now();
+    let native = timeframe.native();
+    // Fetched first when nothing is cached or what is cached is old: here
+    // and now with no window, through the window's loader with one, which
+    // answers from the cache this time and the next time from the fetch.
+    let stale = store
+        .coverage(&key, native)
+        .is_none_or(|c| now - c.fetched_at > omacharts_engine::refresh::period(native));
+    if stale {
+        let series = vec![(instrument.clone(), native)];
+        match live {
+            Some(live) => live.warm_series(&series),
+            None if !cfg!(test) => super::refresh_series(store, provider.as_ref(), &series),
+            None => {}
+        }
+    }
+    let bars = crate::alerts::rule_bars(store, &instrument, &key, timeframe, None, now);
+    let display = match &suffix {
+        Some(suffix) => format!("{symbol}.{suffix}"),
+        None => symbol.clone(),
+    };
+    if bars.is_empty() {
+        return Err(Fault::not_found(format!(
+            "no {} bars of {display} are cached yet; open a chart of it, or try again in a moment",
+            timeframe.key()
+        )));
+    }
+    let inputs = Inputs { session_origin: instrument.session_origin, timeframe };
+    let computed = rule.compute(&bars, &inputs);
+    let forming = crate::alerts::forming(&instrument, &bars, timeframe, now);
+    let at = match on_close && forming {
+        true => bars.len().saturating_sub(2),
+        false => bars.len() - 1,
+    };
+    let decimals = omacharts_engine::price_decimals(0.0, bars[at].close, Some(instrument.kind));
+    let holds = rule.holds(&computed, at);
+    let starts = rule.starts(&computed, at);
+    let signals = rule.signals(&computed);
+    let day = |ts: i64| {
+        chrono::DateTime::from_timestamp(ts, 0)
+            .map(|t| {
+                let local = t.with_timezone(&chrono::Local);
+                match timeframe.is_intraday() {
+                    true => local.format("%Y-%m-%d %H:%M").to_string(),
+                    false => local.format("%Y-%m-%d").to_string(),
+                }
+            })
+            .unwrap_or_default()
+    };
+    let values = computed.values_at(at);
+    let warm = rule.warm_up();
+    if as_json {
+        let latest: Vec<Value> = signals
+            .iter()
+            .rev()
+            .take(shown)
+            .map(|&i| json!({"ts": bars[i].ts, "close": bars[i].close}))
+            .collect();
+        return Ok(format!(
+            "{}\n",
+            json!({
+                "symbol": display,
+                "timeframe": timeframe.key(),
+                "rule": rule.to_string(),
+                "event": rule.is_event(),
+                "bars": bars.len(),
+                "warm_up": warm,
+                "at": bars[at].ts,
+                "closed": !(forming && at == bars.len() - 1),
+                "close": bars[at].close,
+                "holds": holds,
+                "starts": starts,
+                "values": values.iter().map(|(s, v)| json!({"series": s.to_string(), "value": v})).collect::<Vec<_>>(),
+                "signal_count": signals.len(),
+                "signals": latest,
+            })
+        ));
+    }
+    let mut out = format!("{display} {} · {rule}\n", timeframe.key());
+    let which = match forming && at == bars.len() - 1 {
+        true => "forming",
+        false => "closed",
+    };
+    let figures: Vec<String> = values
+        .iter()
+        .map(|(s, v)| match v {
+            Some(v) => format!("{s} {v:.decimals$}"),
+            None => format!("{s} —"),
+        })
+        .collect();
+    let verdict = match (holds, starts) {
+        (true, true) => "holds, and fires on this bar",
+        (true, false) => "holds (since an earlier bar)",
+        (false, _) => "does not hold",
+    };
+    out.push_str(&format!(
+        "{} bar {} ({which}), close {:.decimals$}: {verdict}\n  {}\n",
+        if at + 1 == bars.len() { "latest" } else { "last closed" },
+        day(bars[at].ts),
+        bars[at].close,
+        figures.join(" · ")
+    ));
+    if bars.len() < warm {
+        out.push_str(&format!("only {} bars cached; the rule needs {warm} before it can answer\n", bars.len()));
+    }
+    let first = day(bars[0].ts);
+    out.push_str(&format!("fired on {} of {} bars since {first}", signals.len(), bars.len()));
+    if signals.is_empty() {
+        out.push('\n');
+        return Ok(out);
+    }
+    out.push_str(&format!(", latest {}:\n", shown.min(signals.len())));
+    for &i in signals.iter().rev().take(shown) {
+        out.push_str(&format!("  {}  close {:.decimals$}\n", day(bars[i].ts), bars[i].close));
+    }
+    Ok(out)
+}
+
 fn alert_add(store: &Store, m: &clap::ArgMatches, as_json: bool, window: bool) -> Result<String, Fault> {
     use omacharts_engine::alert::{next_id, Alert, Condition};
     let drawing = match arg(m, "drawing") {
@@ -4616,10 +4817,14 @@ fn alert_add(store: &Store, m: &clap::ArgMatches, as_json: bool, window: bool) -
         ),
     };
     let given = alert_condition(m)?;
-    if usize::from(given.is_some()) + usize::from(drawing.is_some()) != 1 {
+    let rule = alert_rule(m)?;
+    if usize::from(given.is_some()) + usize::from(drawing.is_some()) + usize::from(rule.is_some()) != 1 {
         return Err(Fault::usage(
-            "give one of --above, --below, --cross, --cross-up, --cross-down, --enter, --exit or --drawing".into(),
+            "give one of --above, --below, --cross, --cross-up, --cross-down, --enter, --exit, --drawing or --when".into(),
         ));
+    }
+    if rule.is_none() && (arg(m, "timeframe").is_some() || arg(m, "evaluate").is_some()) {
+        return Err(Fault::usage("--timeframe and --evaluate are for a rule, given with --when".into()));
     }
 
     // The symbol: named, the line's, or the focused chart's.
@@ -4642,32 +4847,13 @@ fn alert_add(store: &Store, m: &clap::ArgMatches, as_json: bool, window: bool) -
             (symbol, suffix, Condition::Cross, line.from.price, None)
         }
         (None, Some((condition, level, upper))) => {
-            let (symbol, suffix) = match arg(m, "SYMBOL") {
-                Some(text) => alert_symbol(text)?,
-                None => {
-                    if !window {
-                        return Err(Fault::no_window("focused chart"));
-                    }
-                    let workspace = Workspace::load(store);
-                    let at = workspace.resolve(None)?;
-                    let book = workspace.book(at)?.clone();
-                    let pane = charts::resolve_pane(&book, None)?;
-                    let chart = charts::panes(&book)
-                        .iter()
-                        .find(|p| p["id"].as_u64() == Some(pane as u64))
-                        .cloned()
-                        .unwrap_or_default();
-                    let symbol = chart["symbol"].as_str().unwrap_or("").to_string();
-                    if symbol.is_empty() {
-                        return Err(Fault::refused("the focused chart has no symbol".into()));
-                    }
-                    let suffix = chart["suffix"].as_str().filter(|s| !s.is_empty()).map(str::to_string);
-                    (symbol, suffix)
-                }
-            };
+            let (symbol, suffix) = alert_target(store, m, window)?;
             (symbol, suffix, condition, level, upper)
         }
-        (None, None) => unreachable!("one of them was counted above"),
+        (None, None) => {
+            let (symbol, suffix) = alert_target(store, m, window)?;
+            (symbol, suffix, Condition::Cross, 0.0, None)
+        }
     };
     if let Some(text) = arg(m, "SYMBOL")
         && drawing.is_some()
@@ -4684,11 +4870,18 @@ fn alert_add(store: &Store, m: &clap::ArgMatches, as_json: bool, window: bool) -
     alert.upper = upper;
     alert.drawing = drawing;
     alert.paused = flag(m, "paused");
+    if let Some(rule) = &rule {
+        alert.rule = Some(rule.to_string());
+        alert.timeframe = Some(Timeframe::days(1));
+        alert_rule_settings(m, &mut alert)?;
+    }
     alert_details(m, &mut alert)?;
     // A crossing is measured from the price as it is now, so it is
     // remembered at once when there is one; without it the first check
-    // only learns where the price is.
-    alert.last = alert_last_price(store, &alert);
+    // only learns where the price is. A rule reads its bars instead.
+    if !alert.is_rule() {
+        alert.last = alert_last_price(store, &alert);
+    }
     let text = format!("set {}", alert_describe(&alert));
     let value = alert_json(&alert);
     alerts.push(alert);
@@ -4712,6 +4905,32 @@ fn alert_edit(store: &Store, m: &clap::ArgMatches, as_json: bool) -> Result<Stri
     if given.is_some() && kind.is_some() {
         return Err(Fault::usage("--condition changes the kind and keeps the level; give it or a level, not both".into()));
     }
+    let rule = alert_rule(m)?;
+    if rule.is_some() && (given.is_some() || kind.is_some()) {
+        return Err(Fault::usage("--when sets a rule in place of a price; give it or a price condition, not both".into()));
+    }
+    if let Some(rule) = rule {
+        if let Some(line) = alert.drawing {
+            return Err(Fault::refused(format!("#{id} follows line #{line}; set a rule on a new alert")));
+        }
+        if !alert.is_rule() {
+            alert.timeframe = Some(Timeframe::days(1));
+        }
+        alert.rule = Some(rule.to_string());
+        alert.last = None;
+    }
+    if (arg(m, "timeframe").is_some() || arg(m, "evaluate").is_some()) && !alert.is_rule() {
+        return Err(Fault::usage(format!("#{id} is on a price; --timeframe and --evaluate are for a rule, set with --when")));
+    }
+    if kind.is_some() && alert.is_rule() {
+        return Err(Fault::usage(format!("#{id} fires on a rule; give a price with the condition, such as --above 250")));
+    }
+    if given.is_some() {
+        alert.rule = None;
+        alert.timeframe = None;
+        alert.on_close = false;
+    }
+    alert_rule_settings(m, alert)?;
     if let Some((condition, level, upper)) = given {
         if let Some(line) = alert.drawing {
             return Err(Fault::refused(format!(
@@ -4745,8 +4964,8 @@ fn alert_edit(store: &Store, m: &clap::ArgMatches, as_json: bool) -> Result<Stri
         }
     }
     alert_details(m, alert)?;
-    alert.fired = None;
-    if alert.last.is_none() {
+    alert.restart();
+    if alert.last.is_none() && !alert.is_rule() {
         alert.last = alert_last_price(store, alert);
     }
     let text = format!("changed {}", alert_describe(alert));
@@ -4866,7 +5085,8 @@ fn alert_log(store: &Store, m: &clap::ArgMatches, as_json: bool) -> Result<Strin
         let rows: Vec<Value> = hits
             .iter()
             .map(|(a, h)| {
-                json!({"id": a.id, "symbol": a.spell_symbol(), "name": a.name, "condition": a.condition.key(),
+                json!({"id": a.id, "symbol": a.spell_symbol(), "name": a.name,
+                       "condition": if a.is_rule() { "rule" } else { a.condition.key() }, "rule": a.rule,
                        "at": h.at, "price": h.price.is_finite().then_some(h.price)})
             })
             .collect();
@@ -4886,7 +5106,8 @@ fn alert_log(store: &Store, m: &clap::ArgMatches, as_json: bool) -> Result<Strin
                 true => format!(" at {:.decimals$}", h.price),
                 false => String::new(),
             };
-            format!("{at}  #{} {} {} {}{price}", a.id, a.spell_symbol(), a.condition.key(), a.spell_level(decimals))
+            let condition = if a.is_rule() { "when" } else { a.condition.key() };
+            format!("{at}  #{} {} {condition} {}{price}", a.id, a.spell_symbol(), a.spell_level(decimals))
         })
         .collect();
     Ok(lines.join("\n") + "\n")
@@ -7442,8 +7663,10 @@ mod tests {
                     continue;
                 }
                 let store = seeded();
+                // A quoted word is one with no spaces in it, the quotes being
+                // the shell's: `alert test "rsi(14)<30"`.
                 let mut args: Vec<String> =
-                    verb.example.split_whitespace().map(String::from).collect();
+                    verb.example.split_whitespace().map(|w| w.trim_matches('"').to_string()).collect();
                 // A verb that writes outside the database is told where to
                 // write. `skill install` is the case: running the tests must
                 // not install a skill into the configuration of whoever is
@@ -7503,6 +7726,81 @@ mod tests {
 
     /// An alert is edited, paused, resumed and cloned by its number, and a
     /// channel takes two prices.
+    /// A rule over the bars is read by `alert test`, set with `--when`,
+    /// changed and turned back into a price by `alert edit`, and fires
+    /// when the bars say so.
+    #[test]
+    fn alerts_on_a_rule_are_tested_set_and_checked() {
+        use omacharts_engine::Bar;
+        let store = bare();
+        let index = crate::inventory::everything();
+        let instrument = index.find("AAPL", None).unwrap().clone();
+        let provider = crate::feeds::selected(&store);
+        let key = super::super::cache_key(provider.as_ref(), &instrument).unwrap();
+        // Thirty days down, thirty up: the 5-day average crosses the 20-day
+        // one upward once, on the way back.
+        let start = 1_700_000_000 / 86_400 * 86_400;
+        let bars: Vec<Bar> = (0..60)
+            .map(|i| {
+                let c = if i < 30 { 200.0 - i as f64 } else { 170.0 + (i - 30) as f64 * 3.0 };
+                Bar { ts: start + i * 86_400, open: c, high: c + 1.0, low: c - 1.0, close: c, volume: 1e6 }
+            })
+            .collect();
+        store.write_bars(&key, Timeframe::days(1), &bars);
+        let words = |line: &[&str]| -> Outcome {
+            let args: Vec<String> = std::iter::once("omacharts").chain(line.iter().copied()).map(String::from).collect();
+            dispatch(&args, &store, None, &super::super::Here)
+        };
+
+        let out = words(&["alert", "test", "sma(5) crosses_above sma(20)", "AAPL"]);
+        assert_eq!(out.code, 0, "{}", out.err);
+        assert!(out.out.starts_with("AAPL 1D · sma(5) crosses_above sma(20)\n"), "{}", out.out);
+        assert!(out.out.contains("fired on 1 of 60 bars"), "{}", out.out);
+        let out = words(&["alert", "test", "close > sma(20)", "AAPL", "--json"]);
+        let value: Value = serde_json::from_str(&out.out).unwrap();
+        assert_eq!(value["holds"], json!(true));
+        assert_eq!(value["event"], json!(false));
+        assert_eq!(value["signal_count"], json!(1));
+        assert_eq!(value["values"].as_array().unwrap().len(), 2);
+        assert_eq!(words(&["alert", "test", "sma(5) crosses_above", "AAPL"]).code, EXIT_USAGE);
+        assert_eq!(words(&["alert", "test", "rsi < 30", "AAPL", "--timeframe", "7x"]).code, EXIT_USAGE);
+        assert_eq!(
+            words(&["alert", "test", "rsi < 30", "AAPL", "--timeframe", "1h"]).code,
+            super::super::EXIT_NOT_FOUND,
+            "nothing hourly cached"
+        );
+
+        let out = words(&["alert", "add", "AAPL", "--when", "sma(5) crosses above sma(20)", "--evaluate", "close", "--name", "Trend"]);
+        assert_eq!(out.code, 0, "{}", out.err);
+        assert!(
+            out.out.contains("#1 [Trend] AAPL when sma(5) crosses_above sma(20) on 1D at bar close · armed"),
+            "{}",
+            out.out
+        );
+        assert_eq!(words(&["alert", "add", "AAPL", "--when", "rsi < 30", "--above", "3"]).code, EXIT_USAGE);
+        assert_eq!(words(&["alert", "add", "AAPL", "--above", "3", "--timeframe", "1h"]).code, EXIT_USAGE);
+        assert_eq!(words(&["alert", "add", "AAPL", "--when", "rsi ~ 30"]).code, EXIT_USAGE);
+        assert_eq!(words(&["alert", "edit", "1", "--condition", "above"]).code, EXIT_USAGE);
+        let out = words(&["alert", "edit", "1", "--timeframe", "4h", "--evaluate", "tick"]);
+        assert!(out.out.contains("on 4h · armed"), "{}", out.out);
+        let out = words(&["alert", "edit", "1", "--above", "300"]);
+        assert!(out.out.contains("#1 [Trend] AAPL above 300.00 · armed"), "{}", out.out);
+        assert_eq!(store.alerts()[0].timeframe, None);
+        assert_eq!(words(&["alert", "edit", "1", "--evaluate", "close"]).code, EXIT_USAGE);
+
+        // The latest close is above its 20-day average, so a rule that says
+        // so fires on the next check — once.
+        let out = words(&["alert", "add", "AAPL", "--when", "close > sma(20)", "--note", "trend {{value}}"]);
+        assert_eq!(out.code, 0, "{}", out.err);
+        let fired = crate::alerts::check_quotes(&store, provider.as_ref(), &index, None);
+        assert_eq!(fired.len(), 1, "{fired:?}");
+        assert_eq!(fired[0].title, "AAPL close > sma(20) (1D)");
+        assert!(fired[0].body.starts_with("now 257.00 · sma(20) "), "{}", fired[0].body);
+        assert!(crate::alerts::check_quotes(&store, provider.as_ref(), &index, None).is_empty());
+        assert!(words(&["alert", "log", "2"]).out.contains("#2 AAPL when close > sma(20) at 257.00"));
+        assert!(crate::alerts::levels(&store, "AAPL", None) == vec![300.0], "a rule draws no level");
+    }
+
     #[test]
     fn alerts_are_edited_paused_and_cloned() {
         let store = bare();

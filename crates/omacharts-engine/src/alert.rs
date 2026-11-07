@@ -13,6 +13,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::bars::{Bar, Timeframe};
+use crate::condition::{Inputs, Rule};
+
 /// The settings key the alerts are stored under, as one JSON list.
 pub const SETTING: &str = "alerts";
 
@@ -223,6 +226,22 @@ pub struct Alert {
     /// Every firing, newest last, at most [`LOG_LIMIT`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub log: Vec<Hit>,
+    /// A rule over the bars, such as `sma(20) crosses_above sma(50)`, in
+    /// place of a price level: see [`crate::condition`]. With one, the
+    /// condition and level above mean nothing. Kept as the text it was
+    /// written in, so a rule this build cannot read is still shown as it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
+    /// The bars a rule is read on. Unset is daily.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeframe: Option<Timeframe>,
+    /// Ask a rule only about bars that have closed, rather than about the
+    /// one forming, whose indicators move with every tick.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub on_close: bool,
+    /// The bar a rule last fired on, so that it fires once a bar at most.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bar: Option<i64>,
 }
 
 fn is_once(f: &Frequency) -> bool {
@@ -258,6 +277,54 @@ impl Alert {
             last: None,
             fired: None,
             log: Vec::new(),
+            rule: None,
+            timeframe: None,
+            on_close: false,
+            bar: None,
+        }
+    }
+
+    /// An alert on a rule over the bars rather than on a price.
+    pub fn on_rule(symbol: &str, suffix: Option<&str>, rule: &Rule, timeframe: Timeframe, created: i64) -> Alert {
+        let mut alert = Alert::new(symbol, suffix, Condition::Cross, 0.0, created);
+        alert.rule = Some(rule.to_string());
+        alert.timeframe = Some(timeframe);
+        alert
+    }
+
+    pub fn is_rule(&self) -> bool {
+        self.rule.is_some()
+    }
+
+    /// The rule, read; `None` for a price alert, `Some(Err)` for a rule this
+    /// build cannot read.
+    pub fn parsed_rule(&self) -> Option<Result<Rule, String>> {
+        self.rule.as_deref().map(Rule::parse)
+    }
+
+    /// A price the alert's figures are written to the scale of: its level,
+    /// or for a rule, which has none, the price it last fired at.
+    pub fn scale(&self) -> f64 {
+        match self.is_rule() {
+            true => self.log.last().map_or(0.0, |h| h.price),
+            false => self.level,
+        }
+    }
+
+    /// The bars a rule is read on.
+    pub fn rule_timeframe(&self) -> Timeframe {
+        self.timeframe.unwrap_or(Timeframe::days(1))
+    }
+
+    /// What it fires on, for a list: `Crossing up`, or `Rule on 1h, bar close`.
+    pub fn spell_condition(&self) -> String {
+        match self.is_rule() {
+            true => format!(
+                "Rule on {}{}",
+                self.rule_timeframe().key(),
+                if self.on_close { ", bar close" } else { "" }
+            ),
+            false => self.condition.label().to_string(),
         }
     }
 
@@ -302,6 +369,9 @@ impl Alert {
 
     /// The level, or the channel, as figures: `195.00`, `190.00–200.00`.
     pub fn spell_level(&self, decimals: usize) -> String {
+        if let Some(rule) = &self.rule {
+            return rule.clone();
+        }
         match self.condition.is_channel() {
             true => {
                 let (lo, hi) = self.bounds();
@@ -391,6 +461,80 @@ impl Alert {
         self.last = None;
     }
 
+    /// Put the bars to a rule alert, at `now`, and say whether that fired it.
+    ///
+    /// `bars` are the alert's timeframe, oldest first, the last one perhaps
+    /// still forming — which it can only be while the market is `trading`:
+    /// Friday's daily bar is closed on Saturday morning, a day after it
+    /// opened or not. Asked about the newest bar, or with
+    /// [`Alert::on_close`] the newest that has closed. Fires at most once a
+    /// bar. "Every time" on a rule with a place in it — `rsi(14) > 70` —
+    /// means each time it starts to hold, not every bar it stays true.
+    pub fn check_rule(
+        &mut self,
+        bars: &[Bar],
+        inputs: &Inputs,
+        now: i64,
+        trading: bool,
+        decimals: usize,
+    ) -> Option<Fired> {
+        if !self.is_armed_at(now) {
+            return None;
+        }
+        let rule = self.parsed_rule()?.ok()?;
+        let last = bars.last()?;
+        let forming = trading && last.ts + self.rule_timeframe().seconds() > now;
+        let at = match self.on_close && forming {
+            true => bars.len().checked_sub(2)?,
+            false => bars.len() - 1,
+        };
+        let bar = bars[at].ts;
+        if self.bar == Some(bar) {
+            return None;
+        }
+        let computed = rule.compute(bars, inputs);
+        let hit = match self.frequency {
+            Frequency::Once => rule.holds(&computed, at),
+            Frequency::Every => rule.starts(&computed, at),
+        };
+        if !hit {
+            return None;
+        }
+        let price = last.close;
+        self.bar = Some(bar);
+        if self.frequency == Frequency::Once {
+            self.fired = Some(now);
+        }
+        self.log.push(Hit { at: now, price });
+        if self.log.len() > LOG_LIMIT {
+            self.log.drain(..self.log.len() - LOG_LIMIT);
+        }
+        let values: Vec<String> = computed
+            .values_at(at)
+            .into_iter()
+            .filter(|(s, _)| *s != crate::condition::Source::Close)
+            .filter_map(|(s, v)| v.map(|v| format!("{s} {}", spell_value(v, decimals))))
+            .collect();
+        let value = values.first().map(|v| v.rsplit(' ').next().unwrap_or("").to_string()).unwrap_or_default();
+        let note = self.message(price, decimals).replace("{{value}}", &value);
+        let mut body = format!("now {price:.decimals$}");
+        if !values.is_empty() {
+            body.push_str(&format!(" · {}", values.join(" · ")));
+        }
+        if !note.is_empty() {
+            body.push_str(&format!(" · {note}"));
+        }
+        let what = format!("{} {} ({})", self.spell_symbol(), rule, self.rule_timeframe().key());
+        Some(Fired {
+            id: self.id,
+            title: match self.name.is_empty() {
+                true => what,
+                false => format!("{}: {what}", self.name),
+            },
+            body,
+        })
+    }
+
     /// Stop checking it, keeping everything else.
     pub fn pause(&mut self) {
         self.paused = true;
@@ -403,9 +547,15 @@ impl Alert {
         self.last = None;
     }
 
+    /// Back to being checked from the next bar, as an edit leaves it.
+    pub fn restart(&mut self) {
+        self.fired = None;
+        self.bar = None;
+    }
+
     /// The same alert, ready to be given its own id: armed, with no log.
     pub fn duplicate(&self, created: i64) -> Alert {
-        Alert { id: 0, created, fired: None, paused: false, log: Vec::new(), ..self.clone() }
+        Alert { id: 0, created, fired: None, paused: false, log: Vec::new(), bar: None, ..self.clone() }
     }
 
     /// The last time it fired, from the log or from before there was one.
@@ -434,15 +584,28 @@ impl Alert {
             true => String::new(),
             false => format!(" · {:?}", self.note),
         };
+        let what = match &self.rule {
+            Some(rule) => format!(
+                "when {rule} on {}{}",
+                self.rule_timeframe().key(),
+                if self.on_close { " at bar close" } else { "" }
+            ),
+            None => format!("{} {}", self.condition.key(), self.spell_level(decimals)),
+        };
         format!(
-            "#{}{name} {} {} {}{line}{frequency} · {}{expires}{note}",
+            "#{}{name} {} {what}{line}{frequency} · {}{expires}{note}",
             self.id,
             self.spell_symbol(),
-            self.condition.key(),
-            self.spell_level(decimals),
             self.state(now).key(),
         )
     }
+}
+
+/// An indicator's value, to as many places as it reads: a price to the
+/// instrument's, an oscillator to two.
+fn spell_value(value: f64, decimals: usize) -> String {
+    let places = if value.abs() >= 1000.0 { decimals.min(2) } else { decimals.max(2) };
+    format!("{value:.places$}")
 }
 
 /// Read the stored list; an unreadable row is no alerts rather than a
@@ -610,5 +773,81 @@ mod tests {
         let b = a.duplicate(9);
         assert_eq!((b.id, b.created, b.fired, b.paused, b.log.len()), (0, 9, None, false, 0));
         assert_eq!(b.level, 100.0);
+    }
+
+    fn day_bars(closes: &[f64]) -> Vec<Bar> {
+        closes
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| Bar { ts: i as i64 * 86_400, open: c, high: c, low: c, close: c, volume: 1.0 })
+            .collect()
+    }
+
+    fn rule_alert(text: &str) -> Alert {
+        let rule = Rule::parse(text).unwrap();
+        Alert::on_rule("SPY", None, &rule, Timeframe::days(1), 0)
+    }
+
+    const INPUTS: Inputs = Inputs { session_origin: 0, timeframe: Timeframe::days(1) };
+
+    #[test]
+    fn a_rule_fires_on_the_bar_its_cross_happens() {
+        let mut a = rule_alert("sma(2) crosses_above sma(3)");
+        a.name = "Trend".into();
+        a.note = "go long, sma(2) at {{value}}".into();
+        let b = day_bars(&[10.0, 10.0, 10.0, 11.0]);
+        // Bar 2 newest: flat, nothing yet.
+        assert!(a.check_rule(&b[..3], &INPUTS, 3 * 86_400, true, 2).is_none());
+        let fired = a.check_rule(&b, &INPUTS, 3 * 86_400 + 60, true, 2).expect("crossed on bar 3");
+        assert_eq!(fired.title, "Trend: SPY sma(2) crosses_above sma(3) (1D)");
+        assert_eq!(fired.body, "now 11.00 · sma(2) 10.50 · sma(3) 10.33 · go long, sma(2) at 10.50");
+        assert_eq!((a.fired, a.bar), (Some(3 * 86_400 + 60), Some(3 * 86_400)));
+        a.rearm();
+        assert!(a.check_rule(&b, &INPUTS, 3 * 86_400 + 120, true, 2).is_none(), "once a bar");
+    }
+
+    #[test]
+    fn on_close_waits_for_the_bar_to_finish() {
+        let mut a = rule_alert("close > 10.5");
+        a.on_close = true;
+        let b = day_bars(&[10.0, 10.0, 11.0]);
+        assert!(a.check_rule(&b, &INPUTS, 2 * 86_400 + 3600, true, 2).is_none(), "bar 2 still forming");
+        assert!(a.check_rule(&b, &INPUTS, 3 * 86_400, true, 2).is_some(), "bar 2 closed");
+        let mut weekend = rule_alert("close > 10.5");
+        weekend.on_close = true;
+        assert!(weekend.check_rule(&b, &INPUTS, 2 * 86_400 + 3600, false, 2).is_some(), "no market, no forming bar");
+        let mut live = rule_alert("close > 10.5");
+        assert!(live.check_rule(&b, &INPUTS, 2 * 86_400 + 3600, true, 2).is_some(), "the forming bar counts");
+    }
+
+    #[test]
+    fn every_time_on_a_rule_fires_as_it_starts_to_hold() {
+        let mut a = rule_alert("close > 10.5");
+        a.frequency = Frequency::Every;
+        let b = day_bars(&[10.0, 11.0, 12.0, 10.0, 11.0]);
+        let mut fired = Vec::new();
+        for n in 1..=b.len() {
+            if a.check_rule(&b[..n], &INPUTS, (n as i64 - 1) * 86_400 + 60, true, 2).is_some() {
+                fired.push(n - 1);
+            }
+        }
+        assert_eq!(fired, vec![1, 4]);
+        assert!(a.is_armed_at(10 * 86_400));
+    }
+
+    #[test]
+    fn a_rule_alert_survives_the_store_and_says_what_it_is() {
+        let mut a = rule_alert("rsi(14) crosses_below 30");
+        a.id = 2;
+        a.timeframe = Some(Timeframe::hours(1));
+        a.on_close = true;
+        let list = vec![a.clone()];
+        assert_eq!(from_json(Some(&to_json(&list))), list);
+        assert_eq!(a.describe(2, 0), "#2 SPY when rsi(14) crosses_below 30 on 1h at bar close · armed");
+        assert_eq!(a.spell_condition(), "Rule on 1h, bar close");
+        assert_eq!(a.spell_level(2), "rsi(14) crosses_below 30");
+        let mut broken = a.clone();
+        broken.rule = Some("rsi(14) ~ 3".into());
+        assert!(broken.check_rule(&day_bars(&[1.0, 2.0]), &INPUTS, 0, true, 2).is_none());
     }
 }

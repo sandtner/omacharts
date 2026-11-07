@@ -15,7 +15,8 @@
 //! first is the only one that notifies.
 
 use omacharts_engine::alert::{Alert, Fired};
-use omacharts_engine::{price_decimals, Instrument, Provider, SearchIndex};
+use omacharts_engine::condition::Inputs;
+use omacharts_engine::{price_decimals, Bar, Grid, Instrument, Provider, SearchIndex, Session, Timeframe};
 
 use crate::store::Store;
 
@@ -80,6 +81,18 @@ fn check(
         let Some(instrument) = index.find(&alert.symbol, alert.suffix.as_deref()) else { continue };
         let Some(key) = crate::cli::cache_key(provider, instrument) else { continue };
         let Some(price) = price_of(&key, instrument) else { continue };
+        if alert.is_rule() {
+            let timeframe = alert.rule_timeframe();
+            let bars = rule_bars(store, instrument, &key, timeframe, Some(price), now);
+            let inputs = Inputs { session_origin: instrument.session_origin, timeframe };
+            let decimals = price_decimals(0.0, price, Some(instrument.kind));
+            let trading = omacharts_engine::session::is_trading(instrument, now);
+            if let Some(hit) = alert.check_rule(&bars, &inputs, now, trading, decimals) {
+                fired.push(hit);
+                changed = true;
+            }
+            continue;
+        }
         // An alert on a line follows the line. A line that is gone takes
         // the alert's level with it, so it stays where it last was.
         if let Some(id) = alert.drawing
@@ -116,6 +129,11 @@ fn check(
 /// reason for a check to fail, and the alert is written down as fired
 /// either way.
 pub fn notify(fired: &Fired) {
+    // A test that fires an alert must not put it on the desktop of whoever
+    // is running the tests.
+    if cfg!(test) {
+        return;
+    }
     let _ = std::process::Command::new("notify-send")
         .args([
             "--app-name=Omacharts",
@@ -137,7 +155,7 @@ pub fn levels(store: &Store, symbol: &str, suffix: Option<&str>) -> Vec<f64> {
     store
         .alerts()
         .into_iter()
-        .filter(|a| a.is_armed() && a.is_for(symbol, suffix))
+        .filter(|a| a.is_armed() && !a.is_rule() && a.is_for(symbol, suffix))
         .flat_map(|a| {
             let level = match a.drawing.and_then(|id| store.drawing_by_id(id)) {
                 Some((_, _, drawing)) => drawing.from.price,
@@ -146,6 +164,86 @@ pub fn levels(store: &Store, symbol: &str, suffix: Option<&str>) -> Vec<f64> {
             std::iter::once(level).chain(a.upper.filter(|_| a.condition.is_channel()))
         })
         .collect()
+}
+
+/// The most bars a rule is computed over. Years of daily bars, weeks of
+/// minutes: more than any average here needs to settle, and a check on
+/// every tick stays a fraction of a millisecond.
+const RULE_BARS: usize = 5000;
+
+/// The bars a rule on `timeframe` is read on, as a chart of it would draw
+/// them: from the cache, cleaned, folded when the timeframe is one that is
+/// folded, and with `price` put into the bar still forming.
+pub fn rule_bars(
+    store: &Store,
+    instrument: &Instrument,
+    key: &str,
+    timeframe: Timeframe,
+    price: Option<f64>,
+    now: i64,
+) -> Vec<Bar> {
+    let native = timeframe.native();
+    let mut bars = store.load_bars(key, native);
+    if bars.len() > RULE_BARS * 4 {
+        bars.drain(..bars.len() - RULE_BARS * 4);
+    }
+    omacharts_engine::drawable(&mut bars, timeframe, instrument.kind);
+    if timeframe.is_derived() {
+        bars = omacharts_engine::resample(&bars, timeframe, &Grid::new(instrument, Session::Extended));
+    }
+    if bars.len() > RULE_BARS {
+        bars.drain(..bars.len() - RULE_BARS);
+    }
+    if let (Some(price), Some(last)) = (price.filter(|p| p.is_finite()), bars.last_mut())
+        && last.ts + timeframe.seconds() > now
+    {
+        last.close = price;
+        last.high = last.high.max(price);
+        last.low = last.low.min(price);
+    }
+    bars
+}
+
+/// Whether the newest of `bars` is still forming: inside its timeframe,
+/// and in a market that is trading.
+pub fn forming(instrument: &Instrument, bars: &[Bar], timeframe: Timeframe, now: i64) -> bool {
+    bars.last().is_some_and(|b| b.ts + timeframe.seconds() > now)
+        && omacharts_engine::session::is_trading(instrument, now)
+}
+
+/// The bar series the armed rule alerts read that are due a fetch: none
+/// cached, or old enough that a chart showing them would ask again. At
+/// the series' native timeframe, which is what is fetched.
+pub fn series_due(store: &Store, provider: &dyn Provider, index: &SearchIndex, now: i64) -> Vec<(Instrument, Timeframe)> {
+    use omacharts_engine::refresh::{self, Candidate};
+    let mut out: Vec<(Instrument, Timeframe)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for alert in store.alerts().into_iter().filter(|a| a.is_rule() && a.is_armed()) {
+        let Some(instrument) = index.find(&alert.symbol, alert.suffix.as_deref()) else { continue };
+        let Some(key) = crate::cli::cache_key(provider, instrument) else { continue };
+        let native = alert.rule_timeframe().native();
+        if !seen.insert((key.clone(), native)) {
+            continue;
+        }
+        let due = match store.coverage(&key, native) {
+            None => true,
+            Some(coverage) => {
+                let candidate = Candidate {
+                    delivery: omacharts_engine::Delivery::Polled,
+                    visible: true,
+                    at_latest: true,
+                    timeframe: native,
+                    instrument,
+                    fetched_at: Some(coverage.fetched_at),
+                };
+                refresh::due(&candidate, now).is_ok()
+            }
+        };
+        if due {
+            out.push((instrument.clone(), native));
+        }
+    }
+    out
 }
 
 /// When an alert stops, from how a person says it: `never`, `90m`, `12h`,

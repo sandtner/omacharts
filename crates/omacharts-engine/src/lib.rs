@@ -8,6 +8,7 @@
 pub mod alert;
 pub mod bars;
 pub mod clock;
+pub mod condition;
 pub mod drawings;
 pub mod exchanges;
 pub mod frame;
