@@ -119,10 +119,24 @@ Every indicator the app has, with every parameter it exposes:
 | `stochastic` | `--period` (%K length), `--k-smooth`, `--d-period`, `--overbought`, `--oversold`, `--height`, `--d-color` |
 | `volume` | `--height` |
 | `vwap` | `--anchor`, `--bands`, `--band-alpha` |
-| `volume_profile` | `--anchor`, `--rows` (a number or `auto`), `--value-area`, `--poc-color` |
+| `volume_profile` | `--anchor`, `--rows` (a number or `auto`), `--value-area`, `--poc-color`, `--poc-width`, `--outline` (`on` or `off`), `--outline-color`, `--outline-width`, `--profile-style` (`filled` or `outline`), `--align` (`left` or `right`) |
 
 Anything that draws a line also takes `--color`, `--width` and `--style`, and
 everything takes `--visible`.
+
+**A volume profile's periods can be read and merged.** `chart profile list`
+names each profile on the focused chart — its start and end, point of control
+and value area, and whether it is on screen (`--on-screen` keeps only those) —
+and `chart profile merge --at WHEN` folds the profile holding that moment
+into the one before it, a composite with one point of control and one value
+area; `split --at` puts it back. A composite is the chart's, kept for the
+symbol and the period it was made under. All three need the window, which has
+the bars that say where a period starts.
+
+```
+omacharts chart profile list --on-screen --json
+omacharts chart profile merge --at 2026-10-28
+```
 
 Colours come in two kinds, and the difference matters:
 
@@ -227,6 +241,16 @@ omacharts config set chart_header template,symbol
 cached quotes the watchlist shows, so it is as fresh as the sidebar and fetches
 nothing of its own.
 
+The row centred across the top is `chart_header_center`, and out of the box it
+holds `title`: the chart title, which is stored with each chart rather than
+for the app. `chart set --title` gives a chart its title and `--title ""` takes
+it away; a chart made by splitting another starts with none:
+
+```
+omacharts chart set --title "Semis desk"
+omacharts config set chart_header_center title,stripe
+```
+
 ## The clock
 
 Charts read one time zone and write times one way, for the whole app: the time
@@ -260,8 +284,7 @@ Each chart has a link mode: what a click in the watchlist does to it.
   Split a chart and click a symbol, and the chart in front of you takes it
   while the other keeps what it had.
 * **`follow`** takes every click. Follow charts show the same instrument: a
-  symbol typed on one moves the others, and a pointer on one draws a crosshair
-  on the rest. Make a chart Follow, split it, change the new one's resolution,
+  symbol typed on one moves the others. Make a chart Follow, split it, change the new one's resolution,
   and both walk the watchlist together.
 * **`pinned`** takes none, focused or not — for a context chart such as SPY
   beside a stock. A click that moves nothing, because the focused chart is
@@ -342,7 +365,13 @@ Three changes write nothing, which is what makes the control safe to touch:
 symbol over the Follow charts is the window's business — picking in the sidebar,
 or typing in the search — and a command names the charts it means.
 
-Whether a pointer on a Follow chart draws a line on the other Follow charts:
+## The crosshair across charts of one symbol
+
+A pointer on one chart draws a quieter crosshair at the same moment and price
+on every other chart on screen of the same symbol, whatever their link mode or
+resolution. Charts of different symbols never share one. It is one setting
+for the whole app, on by default — Preferences › Charts › Other › Sync
+crosshair across charts, or the key `sync_crosshair`:
 
 ```
 omacharts chart crosshair off
@@ -595,8 +624,8 @@ years in UTC, so `3M` is the calendar quarters.
 A `chart set` with one bad value changes nothing at all — everything is
 checked before anything is written, so you never get a half-applied chart.
 
-Besides what a chart shows, `chart set` carries how it shows it — `--style`,
-`--bars`, `--session`, `--grid`, `--auto-scale`, `--log-scale`,
+Besides what a chart shows, `chart set` carries how it shows it — `--title`, `--style`,
+`--thickness`, `--bars`, `--session`, `--grid`, `--auto-scale`, `--log-scale`,
 `--indicators` and `--drawings` — and those are stored with the chart,
 so a price axis held still with `--auto-scale off` is still held the next
 time the app opens.
@@ -684,7 +713,8 @@ omacharts chartbook duplicate Macro --name "Macro weekly" --switch
 ## Drawing on a chart
 
 A drawing is a line between two anchors, a box or an ellipse with them at
-opposite corners, or words at one. An anchor is a moment and a price —
+opposite corners, words at one, a volume profile of the bars between two, an anchored VWAP
+from one, or a Fibonacci retracement of the swing between two. An anchor is a moment and a price —
 `2026-09-01,180.5`, or with the minute, `2026-09-01T14:30,180.5`, or unix
 seconds — which is how the chart keeps them too, so a line through two daily
 closes still passes through the same two moments on the hourly chart.
@@ -694,6 +724,7 @@ omacharts chart drawing add line --from 2026-09-01,180.5 --to 2026-09-19,192 --c
 omacharts chart drawing add rect --from 2026-09-08,178 --to 2026-09-12,186 --fill down --alpha 0.25
 omacharts chart drawing add ellipse --from 2026-09-08,178 --to 2026-09-12,186 --config 5
 omacharts chart drawing add text --from 2026-09-10,184 --text "gap fills here"
+omacharts chart drawing add profile --from 2026-09-08,0 --to 2026-09-12,0 --profile-style outline --align right
 omacharts chart drawing list
 omacharts chart drawing set --id 1 --color ink --width 2.5 --arrow end
 omacharts chart drawing set --id 1 --order front
@@ -726,7 +757,59 @@ omacharts chart drawing configure line --config 3 --color teal --arrow end
 omacharts chart drawing reset-configs rect
 ```
 
-**Any drawing can carry words.** `--text` on a line, a box or an ellipse is a
+**A volume profile drawing** (`profile`, or `vp`) reads only the times of its
+anchors: its height is the prices its bars reached. `--color` is its outline
+and `--fill` its background, `--border on|off` whether filled rows have it,
+`--width` its thickness;
+`--poc-color`, `--poc-width`, `--profile-style`, `--align`, `--value-area` and
+`--transparency` are the rest. It is never moved whole, only
+re-spanned, and it takes no words.
+
+**An anchored VWAP** (`avwap`, or `vwap`) reads only the time of its anchor,
+`--from`, and runs from that bar to the last one, worked out again as bars
+arrive. Its properties are the VWAP study's, by the study's names where it
+has them. `--color`, `--width` (0, no line, leaves only its bands) and
+`--style` (`solid`, `dashed`, `dotted`) are its line, and `--source` the price
+each bar adds (`hlc3`, the default, `hl2`, `ohlc4` or `close`). It has the
+study's three bands, at 1, 1.5 and 2 standard deviations and all off:
+`--bands` says which are drawn, any of `1,2,3` by place, or `none`. The
+`--band-*` flags change a band's look: `--band-deviations` (0.1 to 6),
+`--band-shaded on|off`, `--band-alpha` (0 to 1), `--band-color` (a colour, or
+`line` for the line's own), `--band-width` (0 to 12, 0 for no edges) and
+`--band-style`. `--band N` says which band they change; without it they
+change all three, except `--band-deviations`, which needs one. Every one of
+these is part of the style, so `configure avwap --config N` takes them all.
+Like a profile it is never moved whole, only re-anchored, and it takes no
+words.
+
+```
+omacharts chart drawing add avwap --from 2026-09-08,0 --bands 1,3
+omacharts chart drawing set --id 3 --from 2026-09-15,0 --source close
+omacharts chart drawing set --id 3 --band 3 --band-deviations 2.5 --band-color violet
+```
+
+**A Fibonacci retracement** (`fib`, or `fibonacci`, `retracement`) spans the
+swing from `--from` to `--to`: 0 is at `--to` and 1 at `--from`, so the levels
+follow the direction it was drawn. It has the seven levels 0%, 23.6%, 38.2%,
+50%, 61.8%, 78.6% and 100% (typed as ratios, 0.618, or percentages, 61.8%),
+all on, each a hairline in the drawing's
+`--color`. `--levels` says which are drawn (ratios comma-separated, `all` or
+`none`), `--fib-labels on|off` whether each is labelled with its ratio (on
+unless set) and `--price-labels on|off` with its price (off unless set),
+and `--level-color` (a colour, or `drawing` for the drawing's own),
+`--level-width` and `--level-style` change a level's look; `--level RATIO`
+says which, and without it they change all seven. `--width` sets every
+level's thickness at once. All of it is part of the style, so
+`configure fib --config N` takes it too. It is moved whole, like a line, and
+takes no words.
+
+```
+omacharts chart drawing add fib --from 2026-09-08,178 --to 2026-09-19,192
+omacharts chart drawing set --id 4 --level 0.618 --level-color amber --level-style dashed
+omacharts chart drawing set --id 4 --levels 0,0.5,0.618,1 --price-labels on
+```
+
+**Any other drawing can carry words.** `--text` on a line, a box or an ellipse is a
 label on it, placed by `--text-at` — `center` by default, or an edge or a
 corner: `top`, `bottom`, `left`, `right`, `top-left` and the rest. The empty
 string takes a label off again.
@@ -794,12 +877,13 @@ and is numbered below zero, so one id names a drawing wherever it lives.
 `list` names the symbol and both switches; `clear` removes everything the
 chart can see.
 
-By hand: Ctrl+D shows the tools, Alt+L, Alt+H, Alt+A, Alt+Z, Alt+R, Alt+C and
-Alt+T arm them
+By hand: Ctrl+Shift+D shows the tools, Alt+L, Alt+H, Alt+A, Alt+Z, Alt+R, Alt+C,
+Alt+T, Alt+V and Alt+W arm them
 (Escape is the pointer again; a right-click drops a drawing half laid down
 and keeps the tool), a press and a second press (or one
 press-and-drag) place a drawing — except the text tool, where one press puts
-the caret down and you type on the chart; hold Ctrl while placing one or
+the caret down and you type on the chart, and the anchored VWAP, which one
+click on a bar places; hold Ctrl while placing one or
 dragging a corner and the anchor snaps to the nearest open, high, low or
 close of the candle under it, and with a
 tool in hand the crosshair snaps with it to show where — a click selects one (Shift+click or Ctrl+click adds or removes
@@ -810,11 +894,11 @@ the selection is done to all of them, properties included when they are all
 one kind), a drag moves a corner or the whole thing, the arrow keys
 nudge it (Ctrl+Shift+↑/↓ bring it to the front or send it to the back),
 Delete removes it,
-Enter or a right-click opens its properties, Alt+1 to Alt+9 is configuration
+Alt+Enter, a double-click or Properties… in its menu opens its properties, Alt+1 to Alt+9 is configuration
 N, and Ctrl+Z and Ctrl+Y undo and redo on that chart.
 
-Words are typed where they will be drawn: double-click any drawing, or take
-"Edit text" from its menu, and the caret lands on the chart in the drawing's
+Words are typed where they will be drawn: Enter or F2 on a drawing, a
+double-click on a text drawing, or "Edit text" from its menu, and the caret lands on the chart in the drawing's
 own font and ink. Enter commits and Shift+Enter is a newline; Escape leaves
 it as it was; Ctrl+B and Ctrl+I set the selection — or the word the caret is
 in — bold or italic. Ctrl+= and Ctrl+− grow and shrink the selected
@@ -894,7 +978,7 @@ omacharts alert clear --fired             # or --expired; neither clears all of 
 omacharts alert check                     # fetch what is due and check now
 ```
 
-In the window, Ctrl+Shift+A opens the alert manager. Its Alerts tab lists
+In the window, Ctrl+Shift+E opens the alert manager. Its Alerts tab lists
 every alert and can be searched and filtered by state. Each alert has a
 switch that pauses it, resumes it, or arms it again after it has fired, and
 buttons to edit, clone or remove it. The Log tab lists each firing with its
@@ -1054,7 +1138,7 @@ chart's own resolution is used.
 
 ### The backtest dock
 
-In the window, Ctrl+Shift+B opens the backtest dock under the charts. The
+In the window, Ctrl+Shift+T opens the backtest dock under the charts. The
 chart's right-click menu has "Backtest a strategy…" too. The dock runs on
 the focused chart: its symbol, its resolution, and the bars it draws. It
 runs again a moment after the form changes, and when the focus, the symbol,
@@ -1177,26 +1261,46 @@ $ omacharts config bars monochrome
 bars are monochrome; the colours are remembered
   [exit 0]
 
-$ omacharts config bars coloured
-bars carry their direction again, in the "theme-hollow" scheme
+$ omacharts config bars vivid
+bars carry their direction in colour again, in the "theme" scheme
   [exit 0]
 ```
 
-`config bars red-up` is the third answer: the theme's colours the other way
-round, red for a rise and green for a fall, the way charts are read in Taiwan,
-mainland China, Japan and Korea. It remembers the palette in use as well.
+`config bars soft` and `config bars quiet` are the third and fourth
+answers: a slate and a sand from the theme's palette instead of its green and
+red, and two greys made from the theme's text, a rise the lighter, so the
+price sits back on the chart.
+
+Two switches are worn over whichever palette is chosen rather than being
+palettes themselves. A rising candle drawn as an outline is `chart set
+--hollow-up on` for one chart and `config set hollow_up on` for the charts
+made next. Up and down the other way round, red for a rise and green for a
+fall, the way charts are read in Taiwan, mainland China, Japan and Korea, is
+`chart set --swap-colours on` and `config set swap_colours on`. `config bars`
+says `vivid, hollow, swapped` with both on. `config bars coloured`, `config
+bars hollow` and `config bars red-up`, from when Hollow and Red up were
+colourings of their own, still work: `coloured` is `vivid`, and the other two
+are vivid bars with that switch on, on every chart.
 
 Bar colours belong to each chart, so `config bars` answers for every chart at
 once — the charts in every chartbook and the ones made next — the way Apply to
 all charts does in the preferences. One chart on its own is
-`chart set --colouring theme|theme-hollow|theme-red-up|theme-mono`.
+`chart set --colouring theme|theme-soft|theme-quiet|theme-mono`, and
+`theme-hollow` or `theme-red-up` from an earlier version is `theme` with the
+switch on for that chart. A volume pane follows the chart's colouring, swapped
+or not, unless given one of its own: `chart indicator set volume --colouring
+theme-soft`, which is painted its own way round whatever the chart's switch
+says, and `--colouring chart` to follow the chart again. A hollow rise never
+reaches the volume: its bars are solid, with no body to leave open. They are
+the candles' own colours, drawn at `--opacity`, 0.2 to 1 and 0.85 unless set.
 
 `config set bar_scheme theme-mono` changes only what new charts open with, and
 does not remember the scheme that was in use.
 
 What a new chart opens with is a handful of settings, the ones the preferences
-show under Charts: `bar_style`, `bar_scheme`, `chart_session`, `show_grid`,
-`chart_log_scale`, `chart_shows_drawings` and `chart_sends_drawings`. Changing
+show under Charts: `bar_style`, `ohlc_thickness`, `bar_scheme`, `hollow_up`, `swap_colours`,
+`chart_session`, `show_grid`, `chart_log_scale`, `chart_shows_drawings` and
+`chart_sends_drawings`. Changing
 one chart never changes them.
 
 ## Which data feed the charts come from
@@ -1258,7 +1362,11 @@ the resolution moved, the new one.
 
 **A date (keeps the window)** starts the chart at the beginning of that day
 and shows as much time as it shows now, at the same resolution: with ten days
-on screen, `oct 22` shows 22 October to 1 November. Whatever of that is past
+on screen, `oct 12` shows 12 October to 22 October. When that would run past
+now, the window ends now instead and starts as much earlier, so the date
+lands inside it: with ten days on screen on 1 November, `oct 28` and `today`
+both show 22 October to 1 November. The day typed is tinted and named on the
+time axis until the view is zoomed or panned. Whatever of the window is past
 the latest bar is empty room, as a chart scrolled past its end has, and the
 bars widen or narrow to fit. The reply names the whole window. A date is `2026-03-12` or `2026/3/12`;
 `oct 12`, `12 oct` or `10/12` with no year, the latest one that has passed;
@@ -1270,7 +1378,11 @@ year, month, day, so `10/11` is 11 October. A day still to come, such as
 
 ```
 $ omacharts chart range "oct 12"
-date: 12 Oct – 10 Nov (window kept) on pos:0 NVDA 1h in "Manual"
+date: 12 Oct – 22 Oct (window kept) on pos:0 NVDA 1h in "Manual"
+  [exit 0]
+
+$ omacharts chart range today
+date: 22 Oct – 1 Nov (window kept) on pos:0 NVDA 1h in "Manual"
   [exit 0]
 ```
 
@@ -1475,6 +1587,45 @@ the cache will be pruned back under 2.0 GB
 `cache clear` throws every cached series away. Settings, watchlists and
 chartbooks are not cache and are left alone.
 
+## Updates
+
+The installed app downloads new releases in the background and starts the
+newest at the next launch. These ask now, in the terminal they are typed in,
+whether a window is open or not:
+
+```
+$ omacharts update check
+0.2.15 is available · `omacharts update download` gets it
+  [exit 0]
+
+$ omacharts update download
+0.2.15 is ready · the next launch uses it
+  [exit 0]
+```
+
+`--json` gives `running`, `installed`, `latest`, `ready` and `available`. A
+release whose binary for this machine is not up yet says it is being
+published, and is downloaded at a later check.
+
+```
+$ omacharts update reset
+removed 2 · the next launch runs 0.2.14
+  [exit 0]
+```
+
+`update reset` removes every download and everything the updater remembers,
+so the next launch runs the package's version and a version that was set aside
+can be downloaded again. A newer version that has already run is kept, since it
+may have migrated the settings, and so is which copy of the settings came
+before which version, for them to be put back from; `--all` removes both,
+but keeps the copies in `versions/.saved-<version>` to put back by hand.
+`--json` gives `removed`, `kept` and `installed`.
+
+A build that is not `/usr/bin/omacharts` refuses all three with exit 5, and
+nothing is asked for; so does any of them run as root, or `check` and
+`download` with `OMACHARTS_NO_UPDATE` set. That variable, set to anything but
+`0`, runs the package's version and nothing downloaded, for that launch.
+
 ## Backups of your settings
 
 Everything you made — settings, watchlists, chartbooks, drawings, themes — is
@@ -1650,6 +1801,7 @@ story, and adding a manifest would be a second thing to maintain for nothing.
 | `backup` | copies of your settings, and putting one back |
 | `plugin` | the widget in the Omarchy bar |
 | `skill` | the agent skill, installed only when asked |
+| `update` | newer releases, downloaded and used from the next launch |
 
 `omacharts <group> --help` and `omacharts <group> <command> --help` both work,
 as does `omacharts help <group> <command>`.

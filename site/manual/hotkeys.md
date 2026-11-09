@@ -29,8 +29,7 @@ crop: 768,68,1024,1304   (the whole dialog, 16px layout margin; the list scrolls
 Some menus and tooltips write the modifiers in another order (Shift+Ctrl+N
 rather than Ctrl+Shift+N).
 
-The sheet leaves out <kbd>Ctrl</kbd> + <kbd>F</kbd> and <kbd>/</kbd>, the
-keys inside dialogs and while typing on the chart, and the mouse. The
+The sheet leaves out <kbd>/</kbd>, the keys inside dialogs and while typing on the chart, and the mouse. The
 Omarchy plugin's panel has keys of its own, in
 [Omarchy plugin](/manual/bar-widget/#using-it).
 
@@ -39,12 +38,13 @@ Omarchy plugin's panel has keys of its own, in
 | Key | Does | See |
 |---|---|---|
 | Type a letter | Opens the symbol search with that letter in it | [Symbols](/manual/symbols/) |
-| <kbd>Ctrl</kbd> + <kbd>K</kbd> / <kbd>Ctrl</kbd> + <kbd>F</kbd> / <kbd>/</kbd> | Opens the symbol search empty | [Symbols](/manual/symbols/) |
+| <kbd>Ctrl</kbd> + <kbd>K</kbd> / <kbd>/</kbd> | Opens the symbol search empty | [Symbols](/manual/symbols/) |
 | Type a number | Opens **Change resolution** with that digit in it. A bare number is minutes | [Charts](/manual/charts/#choosing-a-resolution) |
 | <kbd>Ctrl</kbd> + <kbd>I</kbd> | The focused chart's indicators | [Indicators](/manual/indicators/) |
 | <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>I</kbd> | The list of indicators to add | [Indicators](/manual/indicators/) |
 | <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>S</kbd> | The focused chart's settings | [Chart settings](/manual/chart-settings/) |
 | <kbd>Ctrl</kbd> + <kbd>,</kbd> | Preferences | [Preferences](/manual/preferences/) |
+| <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>M</kbd> | The Log | [The window](/manual/window/#the-log) |
 | <kbd>F10</kbd> | The main menu | [The window](/manual/window/) |
 | <kbd>?</kbd> / <kbd>Ctrl</kbd> + <kbd>?</kbd> | The Keyboard shortcuts sheet | [The window](/manual/window/) |
 
@@ -56,7 +56,7 @@ Omarchy plugin's panel has keys of its own, in
 | <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>R</kbd> | Renames the open chartbook, in its tab | [Chartbooks](/manual/chartbooks/) |
 | <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>Alt</kbd> + <kbd>X</kbd> | Removes the open chartbook, after asking. The last one cannot be removed | [Chartbooks](/manual/chartbooks/) |
 | <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>←</kbd> <kbd>→</kbd> | The previous or next chartbook | [Chartbooks](/manual/chartbooks/) |
-| <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>O</kbd> | A screenshot of the open chartbook, to the clipboard | [Screenshots](/manual/screenshots/) |
+| <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>O</kbd> | A screenshot of the open chartbook, to the clipboard | [Screenshots](/manual/screenshots/) |
 
 ## Watchlist
 
@@ -77,9 +77,9 @@ From anywhere:
 
 | Key | Does | See |
 |---|---|---|
-| <kbd>Ctrl</kbd> + <kbd>B</kbd> | Shows the sidebar with the keyboard in it, or hides it and gives the keyboard back to the chart | [The window](/manual/window/) |
+| <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>B</kbd> | Shows the sidebar with the keyboard in it, or hides it and gives the keyboard back to the chart | [The window](/manual/window/) |
 | <kbd>↑</kbd> <kbd>↓</kbd> / <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>↑</kbd> <kbd>↓</kbd> | Over a chart, the previous or next symbol in the watchlist, without going to it | [Watchlists](/manual/watchlists/) |
-| <kbd>Ctrl</kbd> + <kbd>1</kbd> … <kbd>9</kbd> | Shows watchlist N, counting down the page of watchlists | [Watchlists](/manual/watchlists/) |
+| <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>1</kbd> … <kbd>9</kbd> | Shows watchlist N, counting down the page of watchlists. The number row, whatever your layout prints on it with Shift held | [Watchlists](/manual/watchlists/) |
 
 ## Arranging charts
 
@@ -108,6 +108,7 @@ From anywhere:
 | <kbd>Ctrl</kbd> + <kbd>H</kbd> | Hides every drawing, or shows them again | [Hiding the drawings](/manual/drawings/#hiding-the-drawings) |
 | <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>H</kbd> | Hides every indicator, or shows them again | [Hiding every indicator](/manual/indicators/#hiding-every-indicator) |
 | <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>H</kbd> | Hides the bars, or shows them again in the style they had | [Hiding the bars](/manual/charts/#hiding-the-bars) |
+| <kbd>F2</kbd> | With no drawing selected, edits the chart title: in the header when it shows the chart title, otherwise in the **Chart title** dialog. With a drawing selected, F2 is the drawing's (below) | [Chart titles](/manual/charts/#chart-titles) |
 | <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>1</kbd> … <kbd>9</kbd> | Chart template N, in the order they are listed | [Chart templates](/manual/chart-templates/) |
 | <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>0</kbd> | No chart template | [Chart templates](/manual/chart-templates/) |
 | <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>PgUp</kbd> <kbd>PgDn</kbd> | The previous or next chart template | [Chart templates](/manual/chart-templates/) |
@@ -122,7 +123,7 @@ Tools and configurations:
 
 | Key | Does | See |
 |---|---|---|
-| <kbd>Ctrl</kbd> + <kbd>D</kbd> | Shows or hides the drawing tools | [Drawings](/manual/drawings/) |
+| <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>D</kbd> | Shows or hides the drawing tools | [Drawings](/manual/drawings/) |
 | <kbd>Alt</kbd> + <kbd>L</kbd> | A line: click where it starts, then where it ends | [Drawings](/manual/drawings/) |
 | <kbd>Alt</kbd> + <kbd>H</kbd> | A horizontal line | [Drawings](/manual/drawings/) |
 | <kbd>Alt</kbd> + <kbd>A</kbd> | An arrow | [Drawings](/manual/drawings/) |
@@ -130,6 +131,9 @@ Tools and configurations:
 | <kbd>Alt</kbd> + <kbd>R</kbd> | A rectangle | [Drawings](/manual/drawings/) |
 | <kbd>Alt</kbd> + <kbd>C</kbd> | A circle, dragged to any shape | [Drawings](/manual/drawings/) |
 | <kbd>Alt</kbd> + <kbd>T</kbd> | Text: click, then type | [Drawings](/manual/drawings/) |
+| <kbd>Alt</kbd> + <kbd>V</kbd> | A volume profile of the span dragged across | [Drawings](/manual/drawings/#volume-profiles) |
+| <kbd>Alt</kbd> + <kbd>W</kbd> | An anchored VWAP from the bar clicked | [Drawings](/manual/drawings/#anchored-vwap) |
+| <kbd>Alt</kbd> + <kbd>F</kbd> | A Fib retracement of the swing dragged across | [Drawings](/manual/drawings/#fib-retracement) |
 | <kbd>Alt</kbd> + <kbd>M</kbd> | Measure: click the start, then the end | [Drawings](/manual/drawings/#measuring-a-move) |
 | <kbd>Alt</kbd> + <kbd>1</kbd> … <kbd>9</kbd> | Configuration N, for the selected drawing or the one about to be drawn | [Drawings](/manual/drawings/) |
 | <kbd>Ctrl</kbd>, held | A point being placed or dragged snaps to the open, high, low or close of the candle under it | [Drawings](/manual/drawings/) |
@@ -138,7 +142,7 @@ With drawings selected:
 
 | Key | Does | See |
 |---|---|---|
-| <kbd>Enter</kbd> / <kbd>F2</kbd> | Puts the caret in the drawing's text | [Drawings](/manual/drawings/) |
+| <kbd>Enter</kbd> / <kbd>F2</kbd> | Puts the caret in the selected drawing's text. With no drawing selected, F2 edits the chart title instead | [Drawings](/manual/drawings/) |
 | <kbd>Alt</kbd> + <kbd>Enter</kbd> | The drawing's properties | [Drawings](/manual/drawings/) |
 | <kbd>←</kbd> <kbd>→</kbd> <kbd>↑</kbd> <kbd>↓</kbd> | Nudges it a pixel. Ten with <kbd>Shift</kbd> | [Drawings](/manual/drawings/) |
 | <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>↑</kbd> <kbd>↓</kbd> | Brings it to the front, or sends it to the back | [Drawings](/manual/drawings/) |
@@ -156,6 +160,7 @@ With an indicator selected:
 | Key | Does | See |
 |---|---|---|
 | <kbd>Alt</kbd> + <kbd>Enter</kbd> | Its settings | [Indicators](/manual/indicators/#selecting-an-indicator) |
+| <kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>+</kbd> / <kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>−</kbd> | Thickens or thins its line, or a volume profile's outline | [Indicators](/manual/indicators/#selecting-an-indicator) |
 | <kbd>Ctrl</kbd> + <kbd>X</kbd> / <kbd>Ctrl</kbd> + <kbd>C</kbd> / <kbd>Ctrl</kbd> + <kbd>V</kbd> | Cuts or copies it, and pastes it on the focused chart | [Indicators](/manual/indicators/#selecting-an-indicator) |
 | <kbd>Delete</kbd> / <kbd>Backspace</kbd> | Removes it | [Indicators](/manual/indicators/#selecting-an-indicator) |
 | <kbd>Esc</kbd> | Clears the selection | [Indicators](/manual/indicators/#selecting-an-indicator) |
@@ -226,8 +231,9 @@ On a chart:
 | Right-click the price axis | **Auto scale price**, **Logarithmic scale**, **Reset chart** | [Charts](/manual/charts/) |
 | Click the symbol in the header | The symbol search | [Symbols](/manual/symbols/) |
 | Click the resolution in the header | The list of resolutions | [Charts](/manual/charts/) |
+| Click the chart title in the header | Edits the chart title in place | [Chart titles](/manual/charts/#chart-titles) |
 | Right-click the header | **Edit header…** | [Charts](/manual/charts/#the-header) |
-| Right-click the resolution strip | **Edit resolutions…** | [Charts](/manual/charts/) |
+| Right-click the resolution strip | **Edit resolutions…**, **Edit header…** | [Charts](/manual/charts/) |
 | Double-click an indicator's name in the legend | Its settings. The eye, gear and bin beside it hide it, open its settings, or remove it | [Indicators](/manual/indicators/) |
 | The gear, top-right | Chart settings | [Chart settings](/manual/chart-settings/) |
 | The corner arrows, top-right | Gives the chart the whole window, or puts it back | [Layouts](/manual/layouts/) |
@@ -249,7 +255,7 @@ Drawing with the mouse:
 | <kbd>Shift</kbd> + click / <kbd>Ctrl</kbd> + click a drawing | Adds it to the selection, or takes it out | [Drawings](/manual/drawings/) |
 | <kbd>Shift</kbd> + drag the empty chart | Selects every drawing the box touches | [Drawings](/manual/drawings/) |
 | <kbd>Ctrl</kbd> + drag a corner | Snaps it to the candle under it | [Drawings](/manual/drawings/) |
-| Double-click a drawing | Puts the caret in it, to type | [Drawings](/manual/drawings/) |
+| Double-click a drawing | Opens its properties. On a text drawing, puts the caret in it | [Drawings](/manual/drawings/) |
 | Click an indicator, or its name in the legend | Selects it | [Indicators](/manual/indicators/#selecting-an-indicator) |
 | Double-click an indicator | Opens its settings | [Indicators](/manual/indicators/#selecting-an-indicator) |
 | Right-click an indicator | Selects it and opens its menu: **Cut**, **Copy**, **Paste**, **Remove**, **Properties…** | [Indicators](/manual/indicators/#selecting-an-indicator) |

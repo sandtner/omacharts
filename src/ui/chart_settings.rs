@@ -14,10 +14,10 @@ use omacharts_engine::indicators::{
     self, Kind, LineStyle, Params, Reset, Stroke, MAX_FILL_ALPHA, MAX_PANE_SHARE, MIN_FILL_ALPHA,
     MIN_PANE_SHARE,
 };
+use omacharts_engine::indicators::profile::{Align, Style};
 use omacharts_engine::theme::ColorChoice;
 use omacharts_engine::{BarColouring, BarStyle, Indicator, Session};
 
-use crate::store::Store;
 use crate::ui::colors;
 use crate::ui::controls;
 use crate::ui::dialogs;
@@ -37,21 +37,21 @@ pub struct ChartSettings;
 
 impl ChartSettings {
     /// The chart's own settings, on the first page.
-    pub fn present(window: &Rc<Window>, store: Rc<Store>) {
-        ChartSettings::open(window, store, Focus::Chart);
+    pub fn present(window: &Rc<Window>) {
+        ChartSettings::open(window, Focus::Chart);
     }
 
     /// Straight to the indicators.
-    pub fn present_indicators(window: &Rc<Window>, store: Rc<Store>) {
-        ChartSettings::open(window, store, Focus::Indicators);
+    pub fn present_indicators(window: &Rc<Window>) {
+        ChartSettings::open(window, Focus::Indicators);
     }
 
     /// Straight to one indicator's panel, for the gear beside it on the chart.
-    pub fn present_indicator(window: &Rc<Window>, store: Rc<Store>, id: u32) {
-        ChartSettings::open(window, store, Focus::Indicator(id));
+    pub fn present_indicator(window: &Rc<Window>, id: u32) {
+        ChartSettings::open(window, Focus::Indicator(id));
     }
 
-    fn open(window: &Rc<Window>, store: Rc<Store>, focus: Focus) {
+    fn open(window: &Rc<Window>, focus: Focus) {
         let dialog = adw::PreferencesDialog::new();
         dialog.set_title("Chart");
         dialog.set_content_width(560);
@@ -63,7 +63,8 @@ impl ChartSettings {
         let chart_page = adw::PreferencesPage::new();
         chart_page.set_title("Chart");
         chart_page.set_icon_name(Some("preferences-system-symbolic"));
-        chart_page.add(&bars_group(window, &store));
+        chart_page.add(&title_group(window));
+        chart_page.add(&bars_group(window));
         chart_page.add(&scales_group(window));
         chart_page.add(&session_group(window));
         chart_page.add(&drawings_group(window));
@@ -116,6 +117,23 @@ impl ChartSettings {
         });
         rebuild_indicators(&owner, &dialog, &list);
         template_rows(window, &dialog, &templates, &Refresh::rebuilding(&owner, &dialog, &list));
+        {
+            // A command can add, change or take away an indicator while the
+            // list is open, and the list reads it again.
+            let owner = Rc::downgrade(&owner);
+            let dialog_weak = dialog.downgrade();
+            let list = list.clone();
+            window.watch_chart(move || {
+                let (Some(owner), Some(dialog)) = (owner.upgrade(), dialog_weak.upgrade()) else {
+                    return false;
+                };
+                if dialog.root().is_none() {
+                    return false;
+                }
+                rebuild_indicators(&owner, &dialog, &list);
+                true
+            });
+        }
 
         dialog.present(Some(&window.window));
         match focus {
@@ -269,7 +287,50 @@ fn template_rows(
     fill();
 }
 
-fn bars_group(window: &Rc<Window>, store: &Rc<Store>) -> adw::PreferencesGroup {
+/// The row a chart's title is typed into.
+pub const TITLE_LABEL: &str = "Title";
+
+/// The chart title, first, since it is what the chart is called. Kept
+/// as it is typed, and blank for none.
+fn title_group(window: &Rc<Window>) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::new();
+    let row = adw::EntryRow::new();
+    row.set_title(TITLE_LABEL);
+    row.set_text(&window.chart_title());
+    // Set while the row is brought up to date with a title given elsewhere,
+    // so that reading it is not taken for typing it.
+    let syncing = Rc::new(std::cell::Cell::new(false));
+    let typed = window.clone();
+    let quiet = syncing.clone();
+    row.connect_changed(move |row| {
+        if !quiet.get() {
+            typed.set_chart_title(&row.text());
+        }
+    });
+    group.add(&row);
+
+    // Titled in the header or by a command while this is open, the row reads
+    // the title again; not while it says the same thing, which is every time
+    // it is the row's own typing that changed it, trailing space and all.
+    let weak = Rc::downgrade(window);
+    let shown = row.downgrade();
+    window.watch_chart(move || {
+        let (Some(window), Some(row)) = (weak.upgrade(), shown.upgrade()) else { return false };
+        if row.root().is_none() {
+            return false;
+        }
+        let title = window.chart_title();
+        if crate::ui::window::clean_title(&row.text()) != title {
+            syncing.set(true);
+            row.set_text(&title);
+            syncing.set(false);
+        }
+        true
+    });
+    group
+}
+
+fn bars_group(window: &Rc<Window>) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::new();
     group.set_title("Bars");
 
@@ -288,75 +349,194 @@ fn bars_group(window: &Rc<Window>, store: &Rc<Store>) -> adw::PreferencesGroup {
 
     let colouring = adw::ComboRow::new();
     colouring.set_title("Colouring");
-    fill_colourings(&colouring, window.bar_style(), window.bar_colouring());
+    fill_colourings(&colouring, window.bar_colouring());
     colouring.set_sensitive(!window.bars_hidden());
+
+    // The two switches worn over the colouring. Greyed with it while the
+    // bars are hidden; the hollow rise also on OHLC bars, which have no
+    // body to leave open, and the swap on a colouring that paints the same
+    // either way.
+    let hollow = adw::SwitchRow::new();
+    hollow.set_title(HOLLOW_LABEL);
+    hollow.set_active(window.bars_hollow_up());
+    let swapped = adw::SwitchRow::new();
+    swapped.set_title(SWAP_LABEL);
+    swapped.set_active(window.bars_swapped());
+    let theme = window.theme();
+    let shown = !window.bars_hidden();
+    hollow.set_sensitive(shown && hollow_applies(window.bar_style()));
+    swapped.set_sensitive(shown && two_toned(&theme, window.bar_colouring()));
+
+    // Set while the rows are being brought up to date with a chart changed
+    // from elsewhere, so that reading the change is not taken for making it.
+    let syncing = Rc::new(std::cell::Cell::new(false));
+
+    // How thick OHLC bars are drawn, offered only while they are.
+    let thickness = {
+        let window = window.clone();
+        let syncing = syncing.clone();
+        controls::bounded_row(
+            THICKNESS_LABEL,
+            None,
+            f64::from(window.ohlc_thickness()),
+            f64::from(crate::chart_defaults::MIN_OHLC_THICKNESS),
+            f64::from(crate::chart_defaults::MAX_OHLC_THICKNESS),
+            1.0,
+            0,
+            move |px| {
+                let px = px.round() as u8;
+                if !syncing.get() && px != window.ohlc_thickness() {
+                    window.set_ohlc_thickness(px);
+                }
+            },
+        )
+    };
+    thickness.row.set_visible(!window.bars_hidden() && window.bar_style() == BarStyle::Ohlc);
 
     let window_for_style = window.clone();
     let colouring_for_style = colouring.clone();
+    let hollow_for_style = hollow.clone();
+    let swapped_for_style = swapped.clone();
+    let syncing_for_style = syncing.clone();
+    let thickness_for_style = thickness.row.clone();
     row.connect_selected_notify(move |row| {
+        if syncing_for_style.get() {
+            return;
+        }
+        let ohlc = BarStyle::ALL.get(row.selected() as usize) == Some(&BarStyle::Ohlc);
+        thickness_for_style.set_visible(ohlc);
         if row.selected() == hidden_at {
             window_for_style.set_bars_hidden(true);
             colouring_for_style.set_sensitive(false);
+            hollow_for_style.set_sensitive(false);
+            swapped_for_style.set_sensitive(false);
         } else if let Some(style) = BarStyle::ALL.get(row.selected() as usize).copied() {
             window_for_style.set_bar_style(style);
-            fill_colourings(&colouring_for_style, style, window_for_style.bar_colouring());
             colouring_for_style.set_sensitive(true);
+            hollow_for_style.set_sensitive(hollow_applies(style));
+            let theme = window_for_style.theme();
+            swapped_for_style.set_sensitive(two_toned(&theme, window_for_style.bar_colouring()));
         }
     });
     group.add(&row);
+    group.add(&thickness.row);
 
     let window_for_colouring = window.clone();
+    let swapped_for_colouring = swapped.clone();
+    let syncing_for_colouring = syncing.clone();
     colouring.connect_selected_notify(move |row| {
-        if filling_colourings(row) {
+        if filling_colourings(row) || syncing_for_colouring.get() {
             return;
         }
-        let style = window_for_colouring.bar_style();
-        let Some(chosen) = BarColouring::offered(style).get(row.selected() as usize).copied()
-        else {
+        let Some(chosen) = BarColouring::ALL.get(row.selected() as usize).copied() else {
             return;
         };
-        if chosen != window_for_colouring.bar_colouring().for_style(style) {
+        if chosen != window_for_colouring.bar_colouring() {
             window_for_colouring.set_bar_colouring(chosen);
         }
+        let theme = window_for_colouring.theme();
+        swapped_for_colouring.set_sensitive(two_toned(&theme, chosen));
     });
     group.add(&colouring);
 
-    // One switch for the window rather than one per chart: it is about how the
-    // charts behave towards each other, which is not a property of any one of
-    // them.
-    let sync = adw::ActionRow::new();
-    sync.set_title("Crosshair across Follow charts");
-    let switch = gtk::Switch::new();
-    switch.set_valign(gtk::Align::Center);
-    switch.set_active(store.setting_bool(crate::ui::window::SETTING_SYNC_CROSSHAIR, true));
-    let window_for_sync = window.clone();
-    let store_for_sync = store.clone();
-    switch.connect_state_set(move |_, on| {
-        store_for_sync.set_setting_bool(crate::ui::window::SETTING_SYNC_CROSSHAIR, on);
-        if !on {
-            window_for_sync.clear_echoes();
+    let window_for_hollow = window.clone();
+    let syncing_for_hollow = syncing.clone();
+    hollow.connect_active_notify(move |row| {
+        if !syncing_for_hollow.get() && row.is_active() != window_for_hollow.bars_hollow_up() {
+            window_for_hollow.set_bars_hollow_up(row.is_active());
         }
-        glib::Propagation::Proceed
     });
-    sync.add_suffix(&switch);
-    group.add(&sync);
+    group.add(&hollow);
+
+    let window_for_swapped = window.clone();
+    let syncing_for_swapped = syncing.clone();
+    swapped.connect_active_notify(move |row| {
+        if !syncing_for_swapped.get() && row.is_active() != window_for_swapped.bars_swapped() {
+            window_for_swapped.set_bars_swapped(row.is_active());
+        }
+    });
+    group.add(&swapped);
+
+    // A command, or a theme, can change the chart while this is open; the
+    // rows read it again rather than go on describing what it was. Weakly,
+    // so the window does not keep a closed dialog's rows alive.
+    let weak = Rc::downgrade(window);
+    let rows = (row.downgrade(), colouring.downgrade(), hollow.downgrade(), swapped.downgrade());
+    let thickness = (thickness.row.downgrade(), thickness.adjustment.clone());
+    window.watch_chart(move || {
+        let (Some(window), Some(row), Some(colouring), Some(hollow), Some(swapped)) =
+            (weak.upgrade(), rows.0.upgrade(), rows.1.upgrade(), rows.2.upgrade(), rows.3.upgrade())
+        else {
+            return false;
+        };
+        if row.root().is_none() {
+            return false;
+        }
+        syncing.set(true);
+        sync_bars(&window, &row, &colouring, &hollow, &swapped, hidden_at);
+        if let Some(shown) = thickness.0.upgrade() {
+            shown.set_visible(!window.bars_hidden() && window.bar_style() == BarStyle::Ohlc);
+            thickness.1.set_value(f64::from(window.ohlc_thickness()));
+        }
+        syncing.set(false);
+        true
+    });
 
     group
 }
 
-/// Offer the colourings a bar of `style` can be painted in, with `current`
-/// selected — as an OHLC bar draws it, so a hollow chart turned into OHLC
-/// reads as coloured, which is what it shows.
+/// Bring the Bars rows to what the focused chart is wearing now.
+fn sync_bars(
+    window: &Rc<Window>,
+    row: &adw::ComboRow,
+    colouring: &adw::ComboRow,
+    hollow: &adw::SwitchRow,
+    swapped: &adw::SwitchRow,
+    hidden_at: u32,
+) {
+    let hidden = window.bars_hidden();
+    row.set_selected(match hidden {
+        true => hidden_at,
+        false => BarStyle::ALL.iter().position(|s| *s == window.bar_style()).unwrap_or(0) as u32,
+    });
+    let current = window.bar_colouring();
+    colouring.set_selected(BarColouring::ALL.iter().position(|c| *c == current).unwrap_or(0) as u32);
+    colouring.set_sensitive(!hidden);
+    hollow.set_active(window.bars_hollow_up());
+    swapped.set_active(window.bars_swapped());
+    hollow.set_sensitive(!hidden && hollow_applies(window.bar_style()));
+    swapped.set_sensitive(!hidden && two_toned(&window.theme(), current));
+}
+
+/// What the two switches over the colouring are called, in a chart's
+/// settings and in the preferences alike.
+pub const HOLLOW_LABEL: &str = "Hollow up bars";
+pub const SWAP_LABEL: &str = "Swap up and down colours";
+/// The row for how many pixels wide OHLC bars are drawn.
+pub const THICKNESS_LABEL: &str = "Thickness";
+
+/// Whether turning `colouring` round would change what it paints, which is
+/// when the switch for it is offered. Monochrome paints a rise and a fall
+/// alike, so there is nothing to turn round.
+pub fn two_toned(theme: &omacharts_engine::Theme, colouring: BarColouring) -> bool {
+    colouring.scheme(theme).is_two_toned()
+}
+
+/// Whether a hollow rise would show on a bar of `style`: a candle has a
+/// body to leave open, an OHLC bar does not.
+pub fn hollow_applies(style: BarStyle) -> bool {
+    style == BarStyle::Candles
+}
+
+/// Offer the four palettes, with `current` selected.
 ///
 /// A new model selects its first entry on the way in, which the row's own
 /// handler would take for a choice; [`filling_colourings`] tells it not to.
-pub fn fill_colourings(row: &adw::ComboRow, style: BarStyle, current: BarColouring) {
-    let offered = BarColouring::offered(style);
-    let names: Vec<&str> = offered.iter().map(|c| c.label(style)).collect();
+pub fn fill_colourings(row: &adw::ComboRow, current: BarColouring) {
+    let names: Vec<&str> = BarColouring::ALL.iter().map(|c| c.label()).collect();
     row.set_widget_name(FILLING);
     row.set_model(Some(&gtk::StringList::new(&names)));
-    let shown = current.for_style(style);
-    row.set_selected(offered.iter().position(|c| *c == shown).unwrap_or(0) as u32);
+    row.set_selected(BarColouring::ALL.iter().position(|c| *c == current).unwrap_or(0) as u32);
     row.set_widget_name("");
 }
 
@@ -685,25 +865,25 @@ impl IndicatorList {
 /// They ask for the colour every time they are drawn instead, and the colour
 /// row repaints them when it changes one.
 #[derive(Clone)]
-struct Ink {
+pub(crate) struct Ink {
     colour: Rc<dyn Fn() -> String>,
     samples: Rc<RefCell<Vec<glib::WeakRef<gtk::DrawingArea>>>>,
 }
 
 impl Ink {
-    fn new(colour: impl Fn() -> String + 'static) -> Ink {
+    pub(crate) fn new(colour: impl Fn() -> String + 'static) -> Ink {
         Ink { colour: Rc::new(colour), samples: Rc::new(RefCell::new(Vec::new())) }
     }
 
-    fn colour(&self) -> String {
+    pub(crate) fn colour(&self) -> String {
         (self.colour)()
     }
 
-    fn watch(&self, area: &gtk::DrawingArea) {
+    pub(crate) fn watch(&self, area: &gtk::DrawingArea) {
         self.samples.borrow_mut().push(area.downgrade());
     }
 
-    fn repaint(&self) {
+    pub(crate) fn repaint(&self) {
         for area in self.samples.borrow().iter() {
             if let Some(area) = area.upgrade() {
                 area.queue_draw();
@@ -768,7 +948,7 @@ fn rebuild_indicators(
         (None, true, _) => None,
         (None, false, true) => Some("Nothing yet.".to_string()),
         (None, false, false) => Some(
-            "Drag to reorder. The list is the chart, top to bottom; colours come from the theme."
+            "Drag to reorder. Colours come from the theme."
                 .to_string(),
         ),
     };
@@ -780,20 +960,12 @@ fn rebuild_indicators(
     }
     .as_str());
 
-    // The price plot is a row of the list because strips can be stacked above it
-    // as well as below, and a list showing only the strips could not say which
-    // side of the price each one is on. A chart with no strips has no stack to
-    // describe, so it is left out there.
-    let stacked = indicators.iter().any(|i| i.kind.in_own_pane());
-    let price_at = if stacked { price_row_at(&indicators) } else { usize::MAX };
-    for (at, indicator) in indicators.iter().enumerate() {
-        if at == price_at {
-            list.push(&price_row(owner, &refresh));
-        }
+    // The price is not a row: every strip sits below it, so the list shows
+    // only what can be changed. If where a strip sits becomes a setting, the
+    // price comes back as a row strips are dropped across (see
+    // `indicators::cross_price`).
+    for indicator in &indicators {
         list.push(&indicator_row(owner, dialog, &refresh, &indicators, indicator));
-    }
-    if price_at == indicators.len() {
-        list.push(&price_row(owner, &refresh));
     }
 
     if indicators.is_empty() {
@@ -808,64 +980,6 @@ fn rebuild_indicators(
         });
         list.push(&empty);
     }
-}
-
-/// Where the price plot sits in the list: above the first strip that is below
-/// it, and at the end when every strip is above it.
-///
-/// The strips above the price are listed before the strips below it, which is
-/// what every way of reordering them maintains — so one boundary is enough to
-/// place the price among them.
-fn price_row_at(indicators: &[Indicator]) -> usize {
-    indicators
-        .iter()
-        .position(|i| i.kind.in_own_pane() && !i.above_price)
-        .unwrap_or(indicators.len())
-}
-
-/// The price plot's own line in the list.
-///
-/// Not a thing you can configure or remove — it is the chart — so it carries
-/// nothing but its name. It is a place to drop a strip on, which is how a strip
-/// is moved across the price from here.
-fn price_row(owner: &Rc<Owner>, refresh: &Refresh) -> adw::ActionRow {
-    let row = adw::ActionRow::new();
-    row.set_title("Price");
-    row.set_subtitle("Candles, and everything drawn over them");
-    // No handle and no dot. Every other row wears both, so their absence is
-    // what says this row is the chart itself rather than another indicator —
-    // and a mark here would read as the handle it is not.
-    row.add_css_class("dim-label");
-
-    let moving = |value: &glib::Value| value.get::<String>().ok()?.parse::<u32>().ok();
-    let watched = owner.clone();
-    let owner = owner.clone();
-    let refresh = refresh.clone();
-    let target = drop_line::target(
-        &row,
-        // A strip from above the price becomes the first below it, and one
-        // from below the last above it: the line goes on the far side.
-        move |value| {
-            let id = moving(value)?;
-            let all = watched.indicators();
-            let strip = all.iter().find(|i| i.id == id && i.kind.in_own_pane())?;
-            Some(if strip.above_price { drop_line::Edge::After } else { drop_line::Edge::Before })
-        },
-        move |value| {
-            let Some(moving) = moving(value) else { return false };
-            let mut all = owner.indicators();
-            // Dropped on the price: the strip changes sides, which is the one
-            // thing dropping it on another row cannot say.
-            if !indicators::cross_price(&mut all, moving) {
-                return false;
-            }
-            owner.set_indicators(all);
-            refresh.run();
-            true
-        },
-    );
-    row.add_controller(target);
-    row
 }
 
 /// One line in the list: what it is, whether it is drawn, and a way in.
@@ -993,18 +1107,7 @@ fn wire_reorder(owner: &Rc<Owner>, refresh: &Refresh, row: &adw::ActionRow, id: 
             // Taken out before the destination is used, so dropping downwards
             // lands after the row you dropped on and upwards lands in its place —
             // which is what the pointer was over either way.
-            // A strip dropped next to a strip on the other side of the price has
-            // crossed it: the row it was dropped on says which side that is. Read
-            // before the drag is lifted out, because that shifts everything after
-            // it — the row dropped on included.
-            let landing = indicators
-                .get(to)
-                .filter(|onto| onto.kind.in_own_pane())
-                .map(|onto| onto.above_price);
-            let mut dragged = indicators.remove(from);
-            if let (true, Some(side)) = (dragged.kind.in_own_pane(), landing) {
-                dragged.above_price = side;
-            }
+            let dragged = indicators.remove(from);
             indicators.insert(to, dragged);
             owner.set_indicators(indicators);
             refresh.run();
@@ -1204,10 +1307,10 @@ fn appearance_group(
         return Some(volume_colours(owner, refresh, indicator));
     }
 
-    // A volume profile is bars and a mark, not a line, so it is asked about
-    // its two colours and nothing about thickness or pattern.
+    // A volume profile is rows and a mark, not a line: its own outline,
+    // rows and point of control, and no pattern.
     if indicator.kind == Kind::VolumeProfile {
-        return Some(profile_colours(owner, refresh, colour, indicator));
+        return Some(profile_style(owner, refresh, colour, indicator));
     }
 
     let group = adw::PreferencesGroup::new();
@@ -1317,11 +1420,11 @@ fn stroke_rows(
 /// question nobody has an opinion about; what people want is a thicker line or
 /// a thinner one, and they want to see which. Zero stays because a VWAP band
 /// uses it to draw its fill with no outline.
-const WIDTHS: [f64; 5] = [0.0, 1.0, 1.5, 2.5, 4.0];
+pub(crate) const WIDTHS: [f64; 5] = omacharts_engine::indicators::STROKE_WIDTHS;
 
 /// What a style sample is drawn at, so dashes and dots are legible whatever
 /// weight the line itself is set to.
-const LINE_SAMPLE_WIDTH: f64 = 1.5;
+pub(crate) const LINE_SAMPLE_WIDTH: f64 = 1.5;
 
 /// A row of drawn samples, one of them pressed.
 ///
@@ -1384,7 +1487,7 @@ fn picker_row(
     row
 }
 
-fn describe_stroke(width: f64, style: LineStyle) -> String {
+pub(crate) fn describe_stroke(width: f64, style: LineStyle) -> String {
     if width <= 0.0 {
         return "No line".to_string();
     }
@@ -1392,7 +1495,7 @@ fn describe_stroke(width: f64, style: LineStyle) -> String {
 }
 
 /// One option, drawn as the line it would produce.
-fn stroke_sample(width: f64, style: LineStyle, ink: &Ink) -> gtk::DrawingArea {
+pub(crate) fn stroke_sample(width: f64, style: LineStyle, ink: &Ink) -> gtk::DrawingArea {
     let area = gtk::DrawingArea::new();
     area.set_content_width(34);
     area.set_content_height(18);
@@ -1670,23 +1773,83 @@ fn legend_group(owner: &Rc<Owner>, refresh: &Refresh, indicator: &Indicator) -> 
     group
 }
 
-/// A rising and a falling session's volume bar. Unset, each is the candle's
-/// own colour dimmed toward the chart.
+/// A rising and a falling session's volume bar, and how solid both are.
+/// Unset, each is the candle's own colour.
 fn volume_colours(
     owner: &Rc<Owner>,
     refresh: &Refresh,
     indicator: &Indicator,
 ) -> adw::PreferencesGroup {
-    let id = indicator.id;
     let group = adw::PreferencesGroup::new();
     group.set_title("Colours");
+    let rows = Rc::new(RefCell::new(volume_rows(owner, refresh, indicator)));
+    for row in rows.borrow().iter() {
+        group.add(row);
+    }
+    // The palette, and the colours following the chart's, can be changed by
+    // a command while this is open. The rows are built again rather than set,
+    // because building one sets nothing: no choice is made by reading one.
+    let id = indicator.id;
+    let weak = group.downgrade();
+    let owner_for_watch = owner.clone();
+    let refresh = refresh.clone();
+    owner.app.watch_chart(move || {
+        let Some(group) = weak.upgrade().filter(|group| group.root().is_some()) else {
+            return false;
+        };
+        let indicators = owner_for_watch.indicators();
+        let Some(indicator) = indicators.iter().find(|i| i.id == id) else { return true };
+        for row in rows.borrow_mut().drain(..) {
+            group.remove(&row);
+        }
+        let fresh = volume_rows(&owner_for_watch, &refresh, indicator);
+        for row in &fresh {
+            group.add(row);
+        }
+        *rows.borrow_mut() = fresh;
+        true
+    });
+    group
+}
 
+/// The volume pane's palette, its opacity and its two colours, as it is
+/// painted now.
+fn volume_rows(owner: &Rc<Owner>, refresh: &Refresh, indicator: &Indicator) -> Vec<gtk::Widget> {
+    let id = indicator.id;
     let (up, down) =
         crate::ui::chart::volume_colours(indicator, &owner.theme(), &owner.bar_scheme());
-    let Params::Volume { up_color, down_color, .. } = &indicator.params else { return group };
+    let Params::Volume { colouring, up_color, down_color, .. } = &indicator.params else {
+        return Vec::new();
+    };
+    let opacity = percent_row(
+        owner,
+        refresh,
+        id,
+        VOLUME_OPACITY_LABEL,
+        crate::ui::chart::volume_opacity(indicator),
+        omacharts_engine::indicators::MIN_VOLUME_OPACITY,
+        1.0,
+        move |indicator, share| {
+            if let Params::Volume { opacity, .. } = &mut indicator.params {
+                *opacity = share;
+            }
+        },
+    );
+    // The chart's own colouring first, then the four palettes. A volume
+    // bar is a solid bar with no body to leave open, so the chart's
+    // switches reach it only as the swap, through the chart's scheme.
+    let offered = &BarColouring::ALL;
+    let mut names = vec![VOLUME_FOLLOWS_CHART];
+    names.extend(offered.iter().map(|c| c.label()));
+    let current = colouring.and_then(|c| offered.iter().position(|o| *o == c)).map(|at| at + 1);
+    let choice = choice_row(owner, refresh, id, "Colouring", &names, current, move |indicator, at| {
+        if let Params::Volume { colouring, .. } = &mut indicator.params {
+            *colouring = at.checked_sub(1).and_then(|at| offered.get(at).copied());
+        }
+    });
     // Bars have no line to repaint as a sample.
     let unused = Ink::new(String::new);
-    group.add(&colour_row(
+    let up_row = colour_row(
         owner,
         refresh,
         &unused,
@@ -1699,8 +1862,8 @@ fn volume_colours(
             }
         },
         id,
-    ));
-    group.add(&colour_row(
+    );
+    let down_row = colour_row(
         owner,
         refresh,
         &unused,
@@ -1713,12 +1876,20 @@ fn volume_colours(
             }
         },
         id,
-    ));
-    group
+    );
+    vec![choice.upcast(), opacity.upcast(), up_row.upcast(), down_row.upcast()]
 }
 
-/// The two colours a volume profile actually has.
-fn profile_colours(
+/// The volume row that says how solid its bars are.
+pub const VOLUME_OPACITY_LABEL: &str = "Opacity";
+
+/// What a volume pane's colouring row offers first: the way the chart
+/// paints its candles, whatever that is.
+const VOLUME_FOLLOWS_CHART: &str = "Same as the chart";
+
+/// How a volume profile is drawn: its outline, its rows, its point of
+/// control, and its shape and side.
+fn profile_style(
     owner: &Rc<Owner>,
     refresh: &Refresh,
     colour: &str,
@@ -1726,26 +1897,83 @@ fn profile_colours(
 ) -> adw::PreferencesGroup {
     let id = indicator.id;
     let group = adw::PreferencesGroup::new();
-    group.set_title("Colours");
+    group.set_title("Style");
+    let Params::VolumeProfile { style, align, poc_color, outline, outline_color, outline_width, poc_width, .. } =
+        &indicator.params
+    else {
+        return group;
+    };
 
-    // Neither row has samples to repaint: a profile has no line to show.
+    // In the order a profile drawing's properties are in: the outline, the
+    // rows, the point of control, then how it is drawn. No row has samples
+    // to repaint: a profile has no line to show.
     let unused = Ink::new(String::new);
+
+    // Filled rows wear an outline only when asked; the outline style is
+    // nothing but one, so the switch is for the filled style, and the
+    // outline's own two rows wait for there to be an outline.
+    let filled = *style == Style::Filled;
+    let switch = adw::SwitchRow::new();
+    switch.set_title("Outline");
+    switch.set_active(*outline || !filled);
+    switch.set_sensitive(filled);
+    group.add(&switch);
+    let outlined = !filled || *outline;
+    let shown = outline_color.as_ref().map(|c| c.resolve(&owner.theme())).unwrap_or_else(|| colour.to_string());
+    let outline_row = colour_row(
+        owner,
+        refresh,
+        &unused,
+        "Outline colour",
+        &shown,
+        outline_color.clone(),
+        move |indicator, choice| {
+            if let Params::VolumeProfile { outline_color, .. } = &mut indicator.params {
+                *outline_color = choice;
+            }
+        },
+        id,
+    );
+    outline_row.set_sensitive(outlined);
+    group.add(&outline_row);
+    let width_row = thickness_row(owner, refresh, id, "Outline thickness", *outline_width, |indicator, width| {
+        if let Params::VolumeProfile { outline_width, .. } = &mut indicator.params {
+            *outline_width = width;
+        }
+    });
+    width_row.set_sensitive(outlined);
+    group.add(&width_row);
+    {
+        let owner = owner.clone();
+        let refresh = refresh.clone();
+        let (colour_row, width_row) = (outline_row.clone(), width_row.clone());
+        switch.connect_active_notify(move |row| {
+            let on = row.is_active();
+            colour_row.set_sensitive(on);
+            width_row.set_sensitive(on);
+            update(&owner, id, |indicator| {
+                if let Params::VolumeProfile { outline, .. } = &mut indicator.params {
+                    *outline = on;
+                }
+            });
+            refresh.run();
+        });
+    }
+
     group.add(&colour_row(
         owner,
         refresh,
         &unused,
-        "Profile",
+        "Background",
         colour,
         indicator.color.clone(),
         move |indicator, choice| indicator.color = choice,
         id,
     ));
 
-    let Params::VolumeProfile { poc_color, .. } = &indicator.params else { return group };
     // Unset is not "the same as the profile": it is the next colour along the
     // theme's sequence, which is the pair that sequence keeps far apart in hue.
     let shown = owner.theme().companion_or(poc_color.as_ref(), colour);
-
     group.add(&colour_row(
         owner,
         refresh,
@@ -1760,8 +1988,72 @@ fn profile_colours(
         },
         id,
     ));
+    group.add(&thickness_row(owner, refresh, id, "Point of control thickness", *poc_width, |indicator, width| {
+        if let Params::VolumeProfile { poc_width, .. } = &mut indicator.params {
+            *poc_width = width;
+        }
+    }));
+
+    group.add(&choice_row(owner, refresh, id, "Style", &Style::ALL.map(Style::label), Style::ALL.iter().position(|s| s == style), |indicator, at| {
+        if let Params::VolumeProfile { style, .. } = &mut indicator.params {
+            *style = Style::ALL[at];
+        }
+    }));
+    group.add(&choice_row(owner, refresh, id, "Alignment", &Align::ALL.map(Align::label), Align::ALL.iter().position(|a| a == align), |indicator, at| {
+        if let Params::VolumeProfile { align, .. } = &mut indicator.params {
+            *align = Align::ALL[at];
+        }
+    }));
 
     group
+}
+
+/// A line's thickness in pixels, applied as it is spun.
+fn thickness_row(
+    owner: &Rc<Owner>,
+    refresh: &Refresh,
+    id: u32,
+    title: &str,
+    current: f64,
+    apply: impl Fn(&mut Indicator, f64) + 'static,
+) -> adw::SpinRow {
+    use omacharts_engine::indicators::{MAX_OUTLINE_WIDTH, MIN_OUTLINE_WIDTH, OUTLINE_WIDTH_STEP};
+    let row = adw::SpinRow::with_range(MIN_OUTLINE_WIDTH, MAX_OUTLINE_WIDTH, OUTLINE_WIDTH_STEP);
+    row.set_title(title);
+    row.set_digits(1);
+    row.set_value(current);
+    let owner = owner.clone();
+    let refresh = refresh.clone();
+    row.connect_value_notify(move |row| {
+        let width = row.value();
+        update(&owner, id, |indicator| apply(indicator, width));
+        refresh.run();
+    });
+    row
+}
+
+/// A row choosing one of a few named ways, applied as soon as it is picked.
+fn choice_row(
+    owner: &Rc<Owner>,
+    refresh: &Refresh,
+    id: u32,
+    title: &str,
+    names: &[&str],
+    current: Option<usize>,
+    apply: impl Fn(&mut Indicator, usize) + 'static,
+) -> adw::ComboRow {
+    let row = adw::ComboRow::new();
+    row.set_title(title);
+    row.set_model(Some(&gtk::StringList::new(names)));
+    row.set_selected(current.unwrap_or(0) as u32);
+    let owner = owner.clone();
+    let refresh = refresh.clone();
+    row.connect_selected_notify(move |row| {
+        let at = row.selected() as usize;
+        update(&owner, id, |indicator| apply(indicator, at));
+        refresh.run();
+    });
+    row
 }
 
 /// One group per band, because every band has the same half-dozen choices and
@@ -1946,9 +2238,40 @@ fn reset_row(
     let names: Vec<&str> = Reset::ALL.iter().map(|r| r.label()).collect();
     let row = adw::ComboRow::new();
     row.set_title("Reset every");
-    row.set_subtitle("Promoted automatically when the chart is too coarse for it.");
     row.set_model(Some(&gtk::StringList::new(&names)));
     row.set_selected(Reset::ALL.iter().position(|r| *r == current).unwrap_or(0) as u32);
+    // A period the chart is too coarse for cannot be picked: it would be
+    // drawn as another. Only for a chart's own indicators — a template's
+    // are on charts of every resolution.
+    if owner.template.is_none() {
+        let timeframe = owner.app.focused_pane().timeframe.get();
+        // The period being drawn, which a chosen one the chart is too coarse
+        // for is not.
+        let in_use = current.effective_for(timeframe);
+        row.set_selected(Reset::ALL.iter().position(|r| *r == in_use).unwrap_or(0) as u32);
+        let factory = gtk::SignalListItemFactory::new();
+        factory.connect_setup(|_, item| {
+            let label = gtk::Label::new(None);
+            label.set_xalign(0.0);
+            if let Some(item) = item.downcast_ref::<gtk::ListItem>() {
+                item.set_child(Some(&label));
+            }
+        });
+        factory.connect_bind(move |_, item| {
+            let Some(item) = item.downcast_ref::<gtk::ListItem>() else { return };
+            let Some(label) = item.child().and_downcast::<gtk::Label>() else { return };
+            let Some(period) = Reset::ALL.get(item.position() as usize).copied() else { return };
+            label.set_text(period.label());
+            let possible = period.is_meaningful_for(timeframe);
+            label.set_sensitive(possible);
+            label.set_tooltip_text((!possible).then(|| {
+                format!("Too few {} bars in a {} to draw it", timeframe.label(), period.label().to_lowercase())
+            }).as_deref());
+            item.set_selectable(possible);
+            item.set_activatable(possible);
+        });
+        row.set_list_factory(Some(&factory));
+    }
 
     let owner = owner.clone();
     let refresh = refresh.clone();
@@ -2276,14 +2599,13 @@ fn rows_rows(
 ) -> Vec<adw::PreferencesRow> {
     let drawn = owner.profile_rows(id);
 
-    let spin = adw::SpinRow::with_range(4.0, 400.0, 1.0);
+    let spin = adw::SpinRow::with_range(4.0, 800.0, 1.0);
     spin.set_title("Rows");
     spin.set_value(rows.or(drawn).unwrap_or(48) as f64);
     spin.set_sensitive(rows.is_some());
 
     let automatic = adw::ActionRow::new();
     automatic.set_title("Automatic");
-    automatic.set_subtitle("Rows as tall as the instrument's own price steps");
     let switch = gtk::Switch::new();
     switch.set_active(rows.is_none());
     switch.set_valign(gtk::Align::Center);

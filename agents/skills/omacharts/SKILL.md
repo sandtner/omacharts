@@ -15,7 +15,8 @@ description: >-
   sections, chartbooks, link modes, the instrument search, and the cached
   price data. Also for marking a chart up — "draw the trendline", "box the
   range", "circle that gap", "mark the breakout", "label this high" — which
-  is lines, horizontal levels, arrows, zig-zags, boxes, circles and words.
+  is lines, horizontal levels, arrows, zig-zags, boxes, circles, words and
+  volume profiles of a span.
   Use it for any mention of omacharts, and whenever the user speaks about
   charts, watchlists, chartbooks or linked charts as things already on their
   screen.
@@ -242,6 +243,59 @@ same word — is a box with its outline swapped for a curve: the same two
 anchors at opposite corners of the box it is drawn in, the same fill and
 edge, never held round. Reach for it over a box when the empty corners
 matter.
+
+**A volume profile of any span is a drawing.** `profile` (or `vp`) profiles
+the bars between `--from` and `--to`; only their times are read. `--color` is
+its outline, `--fill` its background, `--width` the outline's thickness, and
+`--poc-color`, `--poc-width`, `--profile-style filled|outline`, `--align
+left|right`, `--value-area` and `--transparency` the rest. The study takes
+`--outline-color`, `--outline-width` and `--poc-width` the same way. It takes no `--text`. The study's own profiles are read and merged with
+`chart profile`: `list --on-screen --json` gives each one's `start`, `end`,
+`poc`, `value_area_low` and `value_area_high`, and `merge --at START` folds
+the one starting there into the one before it — read again after each merge,
+since the composite's value area is new. `split --at` undoes it.
+
+```
+omacharts chart drawing add profile --from 2026-10-14,0 --to 2026-10-21,0 --config 9
+omacharts chart profile list --on-screen --json
+omacharts chart profile merge --at 1793836800
+```
+
+**An anchored VWAP is a drawing too.** `avwap` (or `vwap`) is the
+volume-weighted average price from the bar at `--from` (its price is not
+read) to the last bar, never reset and worked out again as bars arrive:
+anchor it where a move began, an earnings gap or a swing low, to see the
+average cost of everyone who bought since. Its properties are the VWAP
+study's: `--style` is its line's pattern, `--source hlc3|hl2|ohlc4|close`
+the price each bar adds, and `--bands 1,2,3` (or `none`) which of its three
+bands are drawn, at 1, 1.5 and 2 standard deviations. `--band N` with
+`--band-deviations`, `--band-shaded`, `--band-alpha`, `--band-color`,
+`--band-width` or `--band-style` changes one band; without `--band` they
+change all three. All of it is part of a configuration, so
+`configure avwap --config N` with the same flags sets up a look to reuse.
+`set --id N --from` re-anchors it. It takes no `--text`.
+
+```
+omacharts chart drawing add avwap --from 2026-10-20,0 --bands 1,3
+omacharts chart drawing configure avwap --config 5 --bands 1,2,3 --band 3 --band-style dashed
+```
+
+**A Fibonacci retracement is a drawing of two anchors.** `fib` spans the
+swing from `--from` to `--to`, with 0 at `--to` and 1 at `--from`, so drag
+order is direction: from a low to a high for the pullback levels. Its seven
+levels (0%, 23.6%, 38.2%, 50%, 61.8%, 78.6%, 100%; typed as ratios or
+percentages) are all on and in the
+drawing's colour, each labelled with its ratio. `--levels` picks which are
+drawn, `--fib-labels on|off` and `--price-labels on|off` say whether a
+level's label shows its ratio and its price (ratio on, price off unless set),
+and `--level RATIO` with `--level-color`,
+`--level-width` or `--level-style` restyles one level; without `--level`
+they change all seven. It takes no `--text`.
+
+```
+omacharts chart drawing add fib --from 2026-10-01,100 --to 2026-10-14,120
+omacharts chart drawing configure fib --config 5 --levels 0,0.382,0.5,0.618,1 --level 0.5 --level-style dashed
+```
 
 **Words go on the chart two ways.** `text` is a drawing that is nothing but
 what it says, at one anchor — `--from` alone, and `--to` is not read. Any

@@ -16,9 +16,14 @@
 
 use omacharts_engine::alert::{Alert, Fired};
 use omacharts_engine::condition::Inputs;
-use omacharts_engine::{price_decimals, Bar, Grid, Instrument, Provider, SearchIndex, Session, Timeframe};
+use omacharts_engine::{price_decimals, Bar, Grid, Instrument, SearchIndex, Session, Timeframe};
 
 use crate::store::Store;
+
+/// Where an instrument's bars are cached: the key of the feed that serves
+/// it, or nothing when no feed does. Each feed caches under its own keys,
+/// so an alert is read from whichever one its symbol is routed to.
+pub type KeyOf<'a> = dyn Fn(&Instrument) -> Option<String> + 'a;
 
 /// The instruments the alerts that are still armed are on: what a refresh
 /// has to fetch, beside the watchlist, for them to be checked at all.
@@ -38,15 +43,16 @@ pub fn instruments(store: &Store, index: &SearchIndex) -> Vec<Instrument> {
 /// alerts on those cache keys — the ones a reply brought prices for.
 pub fn check_quotes(
     store: &Store,
-    provider: &dyn Provider,
+    key_of: &KeyOf,
     index: &SearchIndex,
     keys: Option<&[String]>,
 ) -> Vec<Fired> {
-    check(store, provider, index, |key, instrument| {
+    check(store, key_of, index, |key, instrument| {
         if keys.is_some_and(|keys| !keys.iter().any(|k| k == key)) {
             return None;
         }
-        crate::cli::quote(store, provider, instrument).map(|q| q.last)
+        let bars = crate::cli::daily_bars(store, key, instrument.kind);
+        crate::cli::quote_from(store, key, instrument, &bars).map(|q| q.last)
     })
 }
 
@@ -54,19 +60,19 @@ pub fn check_quotes(
 /// a live tick, or the newest bar of a reply.
 pub fn check_price(
     store: &Store,
-    provider: &dyn Provider,
+    key_of: &KeyOf,
     index: &SearchIndex,
     key: &str,
     price: f64,
 ) -> Vec<Fired> {
-    check(store, provider, index, |k, _| (k == key).then_some(price))
+    check(store, key_of, index, |k, _| (k == key).then_some(price))
 }
 
 /// Put a price to every armed alert the closure has one for, write down what
 /// changed, and notify what fired.
 fn check(
     store: &Store,
-    provider: &dyn Provider,
+    key_of: &KeyOf,
     index: &SearchIndex,
     price_of: impl Fn(&str, &Instrument) -> Option<f64>,
 ) -> Vec<Fired> {
@@ -79,7 +85,7 @@ fn check(
     let mut changed = false;
     for alert in alerts.iter_mut().filter(|a| a.is_armed()) {
         let Some(instrument) = index.find(&alert.symbol, alert.suffix.as_deref()) else { continue };
-        let Some(key) = crate::cli::cache_key(provider, instrument) else { continue };
+        let Some(key) = key_of(instrument) else { continue };
         let Some(price) = price_of(&key, instrument) else { continue };
         if alert.is_rule() {
             let timeframe = alert.rule_timeframe();
@@ -204,20 +210,13 @@ pub fn rule_bars(
     bars
 }
 
-/// Where a rule fired, for a chart to mark: the last moment of the bar it
-/// fired on — so a chart of any resolution puts it on the bar that holds
-/// that moment — and what to call it.
-#[derive(Clone, PartialEq, Debug)]
-pub struct Marker {
-    pub ts: i64,
-    pub label: String,
-}
+pub use omacharts_chart::overlays::Marker;
 
 /// Every bar `alert`'s rule fired on, over the cached history of its own
 /// timeframe. Nothing for a price alert, or a rule this build cannot read.
-pub fn markers_for(store: &Store, provider: &dyn Provider, instrument: &Instrument, alert: &Alert, now: i64) -> Vec<Marker> {
+pub fn markers_for(store: &Store, key_of: &KeyOf, instrument: &Instrument, alert: &Alert, now: i64) -> Vec<Marker> {
     let Some(Ok(rule)) = alert.parsed_rule() else { return Vec::new() };
-    let Some(key) = crate::cli::cache_key(provider, instrument) else { return Vec::new() };
+    let Some(key) = key_of(instrument) else { return Vec::new() };
     let timeframe = alert.rule_timeframe();
     let bars = rule_bars(store, instrument, &key, timeframe, None, now);
     let computed = rule.compute(&bars, &Inputs { session_origin: instrument.session_origin, timeframe });
@@ -234,14 +233,14 @@ pub fn markers_for(store: &Store, provider: &dyn Provider, instrument: &Instrume
 }
 
 /// The markers of every rule alert on a symbol that has not expired.
-pub fn markers(store: &Store, provider: &dyn Provider, instrument: &Instrument, now: i64) -> Vec<Marker> {
-    markers_except(store, provider, instrument, now, None)
+pub fn markers(store: &Store, key_of: &KeyOf, instrument: &Instrument, now: i64) -> Vec<Marker> {
+    markers_except(store, key_of, instrument, now, None)
 }
 
 /// The same, leaving out one alert: the one an editor is previewing.
 pub fn markers_except(
     store: &Store,
-    provider: &dyn Provider,
+    key_of: &KeyOf,
     instrument: &Instrument,
     now: i64,
     except: Option<i64>,
@@ -253,7 +252,7 @@ pub fn markers_except(
         .filter(|a| Some(a.id) != except)
         .filter(|a| a.is_rule() && a.state(now) != State::Expired)
         .filter(|a| a.is_for(&instrument.symbol, instrument.suffix.as_deref()))
-        .flat_map(|a| markers_for(store, provider, instrument, a, now))
+        .flat_map(|a| markers_for(store, key_of, instrument, a, now))
         .collect()
 }
 
@@ -267,13 +266,13 @@ pub fn forming(instrument: &Instrument, bars: &[Bar], timeframe: Timeframe, now:
 /// The bar series the armed rule alerts read that are due a fetch: none
 /// cached, or old enough that a chart showing them would ask again. At
 /// the series' native timeframe, which is what is fetched.
-pub fn series_due(store: &Store, provider: &dyn Provider, index: &SearchIndex, now: i64) -> Vec<(Instrument, Timeframe)> {
+pub fn series_due(store: &Store, key_of: &KeyOf, index: &SearchIndex, now: i64) -> Vec<(Instrument, Timeframe)> {
     use omacharts_engine::refresh::{self, Candidate};
     let mut out: Vec<(Instrument, Timeframe)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for alert in store.alerts().into_iter().filter(|a| a.is_rule() && a.is_armed()) {
         let Some(instrument) = index.find(&alert.symbol, alert.suffix.as_deref()) else { continue };
-        let Some(key) = crate::cli::cache_key(provider, instrument) else { continue };
+        let Some(key) = key_of(instrument) else { continue };
         let native = alert.rule_timeframe().native();
         if !seen.insert((key.clone(), native)) {
             continue;

@@ -11,6 +11,8 @@ Preferences holds the settings that apply to the whole app. Open it with <kbd>Ct
 
 In a narrow window the list of sections becomes a page of its own and a section opens over it.
 
+Reopened while the app is running, the dialog comes back on the section and tab you left it on. Opening it from a chart's header still goes to Charts › Header.
+
 <!-- regenerate:
 theme: tokyo-night
 window: 2560x1040 @2, $SP/kit/hw (a short window, so the dialog is no taller than its content)
@@ -34,18 +36,19 @@ crop: 276,16,2008,1008   (the whole dialog, 12px layout margin)
 | Desktop › **Show in the Omarchy bar** | Puts the Omarchy plugin in the bar, or takes it out. The group appears only on an Omarchy desktop. | [Omarchy plugin](/manual/bar-widget/) |
 | Screenshots › **Also save a PNG** | Keeps a file as well as copying to the clipboard, which always happens. | [Screenshots](/manual/screenshots/) |
 | Screenshots › **Save to**, **Change…** | The folder the PNG goes to. Greyed out while the switch above is off. | [Screenshots](/manual/screenshots/) |
+| Updates › **Update automatically** | Downloads new releases in the background, to start at the next launch. On by default. | [Installation](/manual/installing/#updates) |
 
 ### Charts
 
 <!-- regenerate:
 theme: tokyo-night
-window: 2560x1600 @2, $SP/kit/hw
+window: 2560x1440 @2, bin/headless-window (HOME sandboxed, theme seeded)
 state:
   omacharts chart set --symbol NVDA --resolution 1D
   key ctrl+comma
-  click 214 168          # Charts in the sidebar
+  click 214 147          # Charts in the sidebar
 capture: bin/headless-window shot /tmp/charts.png
-crop: 301,122,1958,1356
+crop: 292,76,1976,1288
 -->
 {% include figure.html src="/assets/manual/preferences/charts.png" alt="Preferences on Charts, Defaults tab" caption="Preferences on Charts, Defaults tab." %}
 
@@ -54,8 +57,10 @@ crop: 301,122,1958,1356
 | Tab › group › row | Does | Chapter |
 |---|---|---|
 | Templates › **Chart templates** | The list. + makes one, a row opens its editor, the pencil renames, the bin deletes. | [Chart templates](/manual/chart-templates/) |
-| Header › **In the header** | The parts every chart's header shows, in order. | [The header](/manual/charts/#the-header) |
+| Header › **Left**, **Center** | The parts every chart's header shows in each section, in order. | [The header](/manual/charts/#the-header) |
 | Other › Chart › **Preset resolutions**, **Edit…** | Opens the Resolutions dialog. | [The preset resolutions](/manual/charts/#the-preset-resolutions) |
+| Other › Chart › **Sync crosshair across charts** | The pointer on one chart draws the same moment on every other chart of the same symbol. On by default. | [Sharing the crosshair](/manual/charts/#sharing-the-crosshair) |
+| Other › Chart › **Zoom sensitivity** | How far the wheel and a two-finger swipe zoom every chart, from 10% to 200%. 100% by default, where a wheel notch zooms as it always has. | [Moving around](/manual/charts/#moving-around) |
 | Other › Time › **Time zone**, **Time format** | How every chart tells the time. | [Time](#time) |
 
 #### Time
@@ -104,7 +109,7 @@ crop: 276,56,2008,1328   (the whole dialog, 12px layout margin)
 
 ## Settings that stay with this machine
 
-The screenshot folder, the **Keep at most** limit and the sidebar width stay with this machine. Restoring another machine's backup leaves them as they were ([Restoring](/manual/your-data/#restoring)).
+The screenshot folder, the **Keep at most** limit, **Update automatically** and the sidebar width stay with this machine. Restoring another machine's backup leaves them as they were ([Restoring](/manual/your-data/#restoring)).
 
 ## See also
 

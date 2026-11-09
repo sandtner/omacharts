@@ -27,7 +27,7 @@ pub fn present_new(window: &Rc<Window>, price: Option<f64>) {
     let pane = window.focused_pane();
     let instrument = pane.instrument.borrow().clone();
     let Some(instrument) = instrument else { return };
-    let last = crate::cli::quote(window.store(), window.provider().as_ref(), &instrument).map(|q| q.last);
+    let last = window.quote(&instrument).map(|q| q.last);
     let Some(level) = price.or(last) else { return };
     let mut draft = Alert::new(
         &instrument.symbol,
@@ -55,7 +55,7 @@ pub fn present(window: &Rc<Window>, draft: Alert) {
     let kind = instrument.as_ref().map(|i| i.kind);
     let last = instrument
         .as_ref()
-        .and_then(|i| crate::cli::quote(window.store(), window.provider().as_ref(), i))
+        .and_then(|i| window.quote(i))
         .map(|q| q.last);
     // A rule has no level; its figures are written to the price's scale.
     let scale = match draft.is_rule() {
@@ -409,7 +409,7 @@ pub fn present(window: &Rc<Window>, draft: Alert) {
                 alert.last = window
                     .symbols()
                     .and_then(|i| i.find(&alert.symbol, alert.suffix.as_deref()).cloned())
-                    .and_then(|i| crate::cli::quote(store, window.provider().as_ref(), &i))
+                    .and_then(|i| window.quote(&i))
                     .map(|q| q.last);
             }
             match alerts.iter_mut().find(|a| a.id == alert.id && alert.id != 0) {
@@ -430,7 +430,7 @@ pub fn present(window: &Rc<Window>, draft: Alert) {
             // poll, so it is checked from the first reply.
             let now = chrono::Utc::now().timestamp();
             if let Some(index) = window.symbols() {
-                let series = crate::alerts::series_due(store, window.provider().as_ref(), &index, now);
+                let series = crate::alerts::series_due(store, &window.key_of(), &index, now);
                 window.warm_series(&series);
             }
             window.refresh_alert_levels();
@@ -511,9 +511,8 @@ fn evaluate(window: &Rc<Window>, alert: &Alert, last: Option<f64>) -> String {
     else {
         return String::new();
     };
-    let provider = window.provider();
-    let Some(key) = crate::cli::cache_key(provider.as_ref(), &instrument) else {
-        return format!("{} does not serve {}", provider.id(), alert.spell_symbol());
+    let Some(key) = window.key_of()(&instrument) else {
+        return format!("no data feed serves {}", alert.spell_symbol());
     };
     let timeframe = alert.rule_timeframe();
     let now = chrono::Utc::now().timestamp();

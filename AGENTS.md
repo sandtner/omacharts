@@ -201,12 +201,17 @@ So both, every time:
 
 ```sh
 XDG_DATA_HOME=$(mktemp -d) DBUS_SESSION_BUS_ADDRESS= omacharts chart list
-dbus-run-session -- env XDG_DATA_HOME=$(mktemp -d) ./target/debug/omacharts
+bin/private-bus env XDG_DATA_HOME=$(mktemp -d) ./target/debug/omacharts
 ```
 
 The first keeps a command in its own process; the second is for when the run
 needs a window of its own. Two separate sessions have changed a live chart by
 getting this half right.
+
+`bin/private-bus` rather than a bare `dbus-run-session`: a bare one
+starts the desktop portal with the desktop's own backend, and under
+Hyprland that backend crashes on its way out when the run ends. Its header
+has the reasoning.
 
 ### And its own compositor, when the run needs to be driven
 
@@ -252,6 +257,25 @@ The limits — coordinates are layout coordinates, the first chord a fresh
 window is sent is swallowed and has to be sent twice, and `swaymsg`'s own
 cursor command cannot drag — are in the review skill's section on driving
 the window, which is where an agent is when it needs them.
+
+### And the suite runs inside it, or its window tests do not run
+
+Every test that builds a widget goes through `crate::ui::on_gtk`, which
+hands it to the one thread GTK is initialised on, because libtest gives
+each test a thread of its own and GTK refuses every thread but its first.
+With no display, `on_gtk` runs nothing and the test passes having checked
+nothing — which is CI, and also any run that cannot reach a compositor. So
+the run that counts is the whole suite inside a headless window:
+
+```sh
+eval "$(bin/headless-window start)"
+bin/headless-window run cargo test --workspace
+bin/headless-window stop
+```
+
+A new widget test wraps its body in `crate::ui::on_gtk(|| { ... })`. One
+that asks GTK on its own thread instead passes by never running, which is
+how a broken one went unnoticed when only the first of them really ran.
 
 ## A fresh target directory is a cold build, and cold here means minutes
 
@@ -318,7 +342,7 @@ neighbour are the same number. `bin/perf-compare`'s header has the whole of the
 reasoning; read it before changing a threshold.
 
 Two things follow for anyone adding to the harness. It must stay inside
-`examples/perf.rs` and `src/ui/chart/bench.rs`, because the comparison copies
+`examples/perf.rs` and `crates/omacharts-chart/src/view/bench.rs`, because the comparison copies
 those two files onto the older revision — a harness that reached into a third
 file could not be grafted, and the job would stop comparing and start reporting.
 And a scenario has to be idempotent: its allocation counts are taken from a

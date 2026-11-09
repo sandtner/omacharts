@@ -1,6 +1,6 @@
 //! The real window on a feed that streams invented prices.
 //!
-//!     dbus-run-session -- env XDG_DATA_HOME=$(mktemp -d) \
+//!     bin/private-bus env XDG_DATA_HOME=$(mktemp -d) \
 //!         cargo run --release --example live_window -- [tick-ms] [charts]
 //!
 //! Opens Omacharts on the synthetic provider: every symbol charts, every
@@ -45,7 +45,7 @@ fn main() -> glib::ExitCode {
     app.connect_activate(move |app| {
         let store = Store::open().expect("a store in the throwaway data home");
         let provider: Arc<dyn Provider> = Arc::new(Synthetic::new(tick));
-        let window = Window::build_with(app, Rc::new(store), provider);
+        let window = Window::build_with(app, Rc::new(store), vec![provider]);
         // Splitting copies the chart being split, so every chart shows the
         // same symbol and they all watch the one subscription.
         for n in 1..charts {

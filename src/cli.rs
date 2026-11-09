@@ -243,6 +243,19 @@ pub trait Live {
         Err(Fault::no_window("focused chart"))
     }
 
+    /// Merge the focused chart's volume profile holding `ts` into the one
+    /// before it, or split the composite holding it. Only the window knows
+    /// where a period begins, from its bars.
+    fn profile(&self, _id: Option<u32>, _ts: i64, _merge: bool) -> Result<String, Fault> {
+        Err(Fault::no_window("focused chart"))
+    }
+
+    /// The focused chart's volume profiles, each with whether it is on
+    /// screen, and the chart they are on.
+    fn profiles(&self, _id: Option<u32>) -> Result<(String, Vec<(omacharts_engine::indicators::Profile, bool)>), Fault> {
+        Err(Fault::no_window("focused chart"))
+    }
+
     /// Read the arrangement back and rebuild from it.
     fn reload_workspace(&self);
     /// Draw the rail again, after a command changed a watchlist.
@@ -260,6 +273,12 @@ pub trait Live {
     /// Draw every chart on screen in the time zone and the time format the
     /// settings now name. Nothing to do without a window.
     fn adopt_clock(&self) {}
+    /// Zoom every chart at the sensitivity the settings now name. Nothing to
+    /// do without a window.
+    fn adopt_zoom(&self) {}
+    /// Put in or take out what the feature flags now switch, in place.
+    /// Nothing to do without a window.
+    fn adopt_features(&self) {}
 
     /// Save a picture of the focused chart, or of the whole open chartbook.
     ///
@@ -429,7 +448,7 @@ fn feed_named(name: &str) -> Result<&'static omacharts_engine::providers::Listed
 /// way and mean entirely different things.
 pub fn is_command(args: &[String]) -> bool {
     let Some(first) = args.get(1).map(String::as_str) else { return false };
-    matches!(first, "help" | "surface") || spec::SURFACE.iter().any(|n| n.name == first)
+    matches!(first, "help" | "surface") || spec::SURFACE.iter().chain(spec::HIDDEN).any(|n| n.name == first)
 }
 
 /// Does this command have to run in the process it was typed in?
@@ -542,7 +561,7 @@ pub struct Quote {
 /// Read an instrument's move from the cache.
 pub fn quote(store: &Store, provider: &dyn Provider, instrument: &Instrument) -> Option<Quote> {
     let key = cache_key(provider, instrument)?;
-    quote_from(store, &key, &daily_bars(store, &key, instrument.kind))
+    quote_from(store, &key, instrument, &daily_bars(store, &key, instrument.kind))
 }
 
 /// The daily bars cached under `key`, as a chart draws them.
@@ -556,21 +575,29 @@ pub fn daily_bars(
     bars
 }
 
-/// The move of the series cached under `key`: its latest close against the
-/// one before, from whichever of the two places a close is kept is newer.
-///
-/// The daily bars, which a chart keeps current, or the closes a batch
-/// fetched for the bar widget. Newer means the later session first, then the
-/// later fetch: a chart refreshed a minute after the widget's batch has the
-/// fresher close for the same day.
 #[cfg(test)]
-fn quote_at(store: &Store, key: &str) -> Option<Quote> {
-    quote_from(store, key, &store.load_bars(key, Timeframe::days(1)))
+fn quote_at(store: &Store, key: &str, instrument: &Instrument) -> Option<Quote> {
+    quote_from(store, key, instrument, &store.load_bars(key, Timeframe::days(1)))
 }
 
-/// The same, from daily bars already loaded: [`daily_bars`], so that what a
-/// chart would not draw is not quoted either.
-pub fn quote_from(store: &Store, key: &str, bars: &[omacharts_engine::Bar]) -> Option<Quote> {
+/// The move of the series cached under `key`, from daily bars already
+/// loaded ([`daily_bars`], so that what a chart would not draw is not quoted
+/// either): its latest close against the one before, from whichever of the
+/// three places a close is kept is newer.
+///
+/// The daily bars; the closes a batch fetched for the sidebar and the bar
+/// widget; and the last bar of an intraday series, which a chart on screen
+/// keeps current on its own clock. Without the third, a 1h chart's candle
+/// moved and the sidebar beside it kept the price from its last batch for
+/// up to a quarter of an hour. Newer means the later session first, then
+/// the later fetch: a chart refreshed a minute after the widget's batch has
+/// the fresher close for the same day.
+pub fn quote_from(
+    store: &Store,
+    key: &str,
+    instrument: &Instrument,
+    bars: &[omacharts_engine::Bar],
+) -> Option<Quote> {
     let daily = Timeframe::days(1);
     let from_bars = match bars {
         [.., previous, last] => {
@@ -592,8 +619,36 @@ pub fn quote_from(store: &Store, key: &str, bars: &[omacharts_engine::Bar]) -> O
             .map_or(c.previous, |bar| bar.close);
         (c.at, c.fetched_at, c.last, previous)
     });
+    // An intraday close only ever stands in for the close of a session the
+    // daily bars or the batch already hold, against that source's previous
+    // close: on its own it says nothing about which close came before. The
+    // batch is usually the one: the daily bars lag a session behind it from
+    // midnight until a chart at 1D is next refreshed. Which session a bar
+    // is in is the exchange's to say, and with no hours known none stands
+    // in: hours this does not know are hours it must not rule on.
+    let hours = omacharts_engine::exchanges::registry().for_instrument(instrument);
+    let stand_in = hours.and_then(|hours| {
+        let (ts, fetched_at, close) = store.latest_intraday_close(key)?;
+        // A future's daily bar holds its whole day; a share's only regular
+        // hours, so its pre- and post-market prints stay out.
+        let counted = hours.part_at(ts).is_some_and(|part| {
+            instrument.kind == omacharts_engine::InstrumentKind::FutureRoot || !part.is_extended()
+        });
+        // Fetched after the close, the last bar can miss the closing
+        // auction (ARA.MX: 5.29 against an official 5.32), and nothing
+        // would replace it until the next session.
+        let day = hours.trading_date(ts)?;
+        let live = hours.is_open(fetched_at) && hours.trading_date(fetched_at) == Some(day);
+        (counted && live).then_some((day, fetched_at, close))
+    });
+    let stand_ins = [from_bars, from_closes].map(|source| {
+        let (at, _, _, previous) = source?;
+        let (day, fetched_at, close) = stand_in?;
+        (hours?.trading_date(at) == Some(day)).then_some((at, fetched_at, close, previous))
+    });
     let newer = |(at, fetched_at, ..): &(i64, i64, f64, f64)| (session_day(*at), *fetched_at);
-    let (as_of, _, last, previous) = [from_bars, from_closes].into_iter().flatten().max_by_key(newer)?;
+    let (as_of, _, last, previous) =
+        [from_bars, from_closes].into_iter().chain(stand_ins).flatten().max_by_key(newer)?;
     let change = last - previous;
     Some(Quote {
         last,
@@ -746,9 +801,13 @@ pub fn plan_refresh(
 /// is the one place that paces requests. Speculative, so they go two seconds
 /// apart and are refused outright while the provider is throttling: a bar
 /// widget must never cost the app its rate limit.
-fn refresh(store: &Store, provider: &dyn Provider, plan: Refresh) {
+///
+/// A loader of `provider`'s own, because pacing and cooldowns are a feed's:
+/// one feed's rate limit must not hold another's rows back.
+fn refresh(provider: &dyn Provider, plan: Refresh) {
     let (sender, receiver) = async_channel::unbounded();
-    let loader = Loader::new(std::sync::Arc::from(crate::feeds::selected(store)), sender);
+    let built = omacharts_engine::providers::built_or_default(provider.id());
+    let loader = Loader::new(std::sync::Arc::from(built), sender);
     let mut outstanding = 0;
     // The batches first: a request each for the whole list, against one each
     // for the rows that need a history.
@@ -782,8 +841,8 @@ fn refresh(store: &Store, provider: &dyn Provider, plan: Refresh) {
 
 /// Fetch bar series here and now, with no window: what `alert test` reads
 /// when nothing, or nothing recent, is cached.
-pub fn refresh_series(store: &Store, provider: &dyn Provider, series: &[(Instrument, Timeframe)]) {
-    refresh(store, provider, Refresh { series: series.to_vec(), ..Refresh::default() });
+pub fn refresh_series(provider: &dyn Provider, series: &[(Instrument, Timeframe)]) {
+    refresh(provider, Refresh { series: series.to_vec(), ..Refresh::default() });
 }
 
 /// Fetch what is due for the alerts' symbols and check them.
@@ -793,29 +852,45 @@ pub fn refresh_series(store: &Store, provider: &dyn Provider, series: &[(Instrum
 /// they land — so there is nothing to report yet, and this says so.
 pub fn check_alerts(store: &Store, live: Option<&dyn Live>) -> Vec<omacharts_engine::alert::Fired> {
     let index = resolver(live);
-    let provider = crate::feeds::selected(store);
+    let feeds = crate::feeds::Feeds::load(store);
+    let key_of = feed_keys(&feeds);
     let instruments = crate::alerts::instruments(store, &index);
     let now = chrono::Utc::now().timestamp();
-    let mut plan = plan_refresh(store, provider.as_ref(), &instruments, now, MAX_BATCHES);
-    plan.series = crate::alerts::series_due(store, provider.as_ref(), &index, now);
-    match live {
-        Some(live) => {
-            live.warm(&plan.bars);
-            live.warm_closes(plan.closes);
-            live.warm_series(&plan.series);
-            Vec::new()
+    let due = crate::alerts::series_due(store, &key_of, &index, now);
+    for (provider, _) in &feeds.feeds {
+        let serves = |instrument: &Instrument| feeds.route(instrument).is_some_and(|(by, _)| by.id() == provider.id());
+        let served: Vec<Instrument> = instruments.iter().filter(|i| serves(i)).cloned().collect();
+        let series: Vec<(Instrument, Timeframe)> = due.iter().filter(|(i, _)| serves(i)).cloned().collect();
+        if served.is_empty() && series.is_empty() {
+            continue;
         }
-        None => {
-            refresh(store, provider.as_ref(), plan);
-            crate::alerts::check_quotes(store, provider.as_ref(), &index, None)
+        let mut plan = plan_refresh(store, provider.as_ref(), &served, now, MAX_BATCHES);
+        plan.series = series;
+        match live {
+            Some(live) => {
+                live.warm(&plan.bars);
+                live.warm_closes(plan.closes);
+                live.warm_series(&plan.series);
+            }
+            None => refresh(provider.as_ref(), plan),
         }
     }
+    match live {
+        Some(_) => Vec::new(),
+        None => crate::alerts::check_quotes(store, &key_of, &index, None),
+    }
+}
+
+/// Where each instrument's bars are cached: under the key of the feed that
+/// serves it. What the alerts and the backtests read bars through.
+pub fn feed_keys(feeds: &crate::feeds::Feeds) -> impl Fn(&Instrument) -> Option<String> + '_ {
+    move |instrument| feeds.route(instrument).and_then(|(provider, _)| cache_key(provider, instrument))
 }
 
 /// The watchlist as JSON, for the bar widget.
 pub fn watchlist_json(store: &Store, refresh_first: bool, live: Option<&dyn Live>) -> String {
     let index = resolver(live);
-    let provider = crate::feeds::selected(store);
+    let feeds = crate::feeds::Feeds::load(store);
 
     let sections = store.watchlist();
     if refresh_first {
@@ -829,25 +904,40 @@ pub fn watchlist_json(store: &Store, refresh_first: bool, live: Option<&dyn Live
             .collect();
         instruments.extend(crate::alerts::instruments(store, &index));
         let now = chrono::Utc::now().timestamp();
-        let mut plan = plan_refresh(store, provider.as_ref(), &instruments, now, MAX_BATCHES);
-        plan.series = crate::alerts::series_due(store, provider.as_ref(), &index, now);
-        match live {
-            // Inside the window, on its main loop. Hand the work to the
-            // loader thread and answer from the cache, which is all the
-            // widget draws anyway: a quote that arrives on the next tick is
-            // not worth six seconds of frozen application.
-            Some(live) => {
-                live.warm(&plan.bars);
-                live.warm_closes(plan.closes);
-                live.warm_series(&plan.series);
+        let key_of = feed_keys(&feeds);
+        let due = crate::alerts::series_due(store, &key_of, &index, now);
+        // One plan per feed, over the rows that feed serves: a batch of
+        // closes is one feed's request, in that feed's spelling. The bar
+        // series rule alerts read go with the feed that serves each.
+        for (provider, _) in &feeds.feeds {
+            let serves = |instrument: &Instrument| {
+                feeds.route(instrument).is_some_and(|(by, _)| by.id() == provider.id())
+            };
+            let served: Vec<Instrument> = instruments.iter().filter(|i| serves(i)).cloned().collect();
+            let series: Vec<(Instrument, Timeframe)> = due.iter().filter(|(i, _)| serves(i)).cloned().collect();
+            if served.is_empty() && series.is_empty() {
+                continue;
             }
-            // A process of its own, with no window and nothing to block —
-            // and nobody else to check the alerts once the prices are in.
-            // In the window the replies do that as they land.
-            None => {
-                refresh(store, provider.as_ref(), plan);
-                crate::alerts::check_quotes(store, provider.as_ref(), &index, None);
+            let mut plan = plan_refresh(store, provider.as_ref(), &served, now, MAX_BATCHES);
+            plan.series = series;
+            match live {
+                // Inside the window, on its main loop. Hand the work to the
+                // loader thread and answer from the cache, which is all the
+                // widget draws anyway: a quote that arrives on the next tick
+                // is not worth six seconds of frozen application.
+                Some(live) => {
+                    live.warm(&plan.bars);
+                    live.warm_closes(plan.closes);
+                    live.warm_series(&plan.series);
+                }
+                // A process of its own, with no window and nothing to block.
+                None => refresh(provider.as_ref(), plan),
             }
+        }
+        // With no window there is nobody else to check the alerts once the
+        // prices are in. In the window the replies do that as they land.
+        if live.is_none() {
+            crate::alerts::check_quotes(store, &key_of, &index, None);
         }
     }
 
@@ -874,7 +964,8 @@ pub fn watchlist_json(store: &Store, refresh_first: bool, live: Option<&dyn Live
             if e > 0 {
                 out.push(',');
             }
-            out.push_str(&entry_json(store, provider.as_ref(), instrument));
+            let serving = feeds.route(instrument).map(|(provider, _)| provider);
+            out.push_str(&entry_json(store, serving, instrument));
         }
         out.push_str("]}");
     }
@@ -950,7 +1041,9 @@ fn colors_json(store: &Store) -> String {
     )
 }
 
-fn entry_json(store: &Store, provider: &dyn Provider, instrument: &Instrument) -> String {
+/// One row, from the feed serving it; `None` when no feed has a name for it,
+/// which leaves it with no price and no line.
+fn entry_json(store: &Store, provider: Option<&dyn Provider>, instrument: &Instrument) -> String {
     let mut fields = format!(
         "{{\"symbol\":{},\"suffix\":{},\"display\":{},\"name\":{},\"kind\":{}",
         json_string(&instrument.symbol),
@@ -962,8 +1055,8 @@ fn entry_json(store: &Store, provider: &dyn Provider, instrument: &Instrument) -
         json_string(&instrument.name),
         json_string(instrument.kind.label()),
     );
-    let quote = quote(store, provider, instrument);
-    if let Some(key) = cache_key(provider, instrument) {
+    let quote = provider.and_then(|provider| quote(store, provider, instrument));
+    if let Some(key) = provider.and_then(|provider| cache_key(provider, instrument)) {
         let bars = daily_bars(store, &key, instrument.kind);
         let mut closes: Vec<(i64, f64)> = bars.iter().map(|bar| (bar.ts, bar.close)).collect();
         // The line ends where the price beside it does. A batch of closes is
@@ -1049,6 +1142,14 @@ impl Live for Rc<crate::ui::Window> {
         Ok(crate::ui::Window::measure(self, anchors))
     }
 
+    fn profile(&self, id: Option<u32>, ts: i64, merge: bool) -> Result<String, Fault> {
+        crate::ui::Window::change_profile_at(self, id, ts, merge).map_err(Fault::not_found)
+    }
+
+    fn profiles(&self, id: Option<u32>) -> Result<(String, Vec<(omacharts_engine::indicators::Profile, bool)>), Fault> {
+        crate::ui::Window::profiles_on_focused(self, id).map_err(Fault::not_found)
+    }
+
     fn flush_workspace(&self) {
         crate::ui::Window::save_workspace(self);
     }
@@ -1079,6 +1180,14 @@ impl Live for Rc<crate::ui::Window> {
 
     fn adopt_clock(&self) {
         crate::ui::Window::adopt_clock(self);
+    }
+
+    fn adopt_zoom(&self) {
+        crate::ui::Window::adopt_zoom(self);
+    }
+
+    fn adopt_features(&self) {
+        crate::ui::Window::adopt_features(self);
     }
 
     fn screenshot(
@@ -1372,7 +1481,7 @@ mod tests {
         }
 
         // The bar reads a rise the way the window does.
-        store.set_setting(crate::theming::SETTING_BARS, omacharts_engine::theme::THEME_RED_UP_ID);
+        store.set_setting_bool(crate::chart_defaults::SETTING_SWAP_COLOURS, true);
         let red: serde_json::Value = serde_json::from_str(&colors_json(&store)).unwrap();
         assert_eq!((&red["up"], &red["down"]), (&parsed["down"], &parsed["up"]));
         assert_eq!(
@@ -1382,7 +1491,9 @@ mod tests {
     }
 
     /// The scheme chosen in the window reaches the bar: somebody who reads a
-    /// rise as red reads it that way in the bar too.
+    /// rise as red reads it that way in the bar too, and still does when it
+    /// was an older version that wrote the choice down, as a scheme of its
+    /// own.
     #[test]
     fn the_payload_follows_whichever_bar_scheme_was_chosen() {
         let store = Store::memory().unwrap();
@@ -1396,7 +1507,7 @@ mod tests {
         assert_eq!(chosen["hover"], theme["hover"]);
     }
 
-    /// Every scheme on offer — filled, hollow, red up and monochrome — reaches
+    /// Every palette on offer — vivid, soft, quiet and monochrome — reaches
     /// the widget whole: the change text, the sparklines (which
     /// are drawn in the same up and down) and the pill all come from the
     /// chosen scheme's colours, by the same rules the chart applies to them.
@@ -1406,7 +1517,7 @@ mod tests {
         let store = Store::memory().unwrap();
         let theming = crate::theming::Theming::load(&store);
         let schemes = omacharts_engine::theme::bar_schemes(&theming.theme());
-        assert_eq!(schemes.len(), 4);
+        assert_eq!(schemes.len(), omacharts_engine::BarColouring::ALL.len());
         for scheme in schemes {
             store.set_setting(crate::theming::SETTING_BARS, &scheme.id);
             let sent: serde_json::Value = serde_json::from_str(&colors_json(&store)).unwrap();
@@ -1452,7 +1563,7 @@ mod tests {
         let index = SearchIndex::new(omacharts_engine::symbols::seed());
         let instrument = index.find("ES", None).unwrap();
 
-        let json = entry_json(&store, &provider, instrument);
+        let json = entry_json(&store, Some(&provider), instrument);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(parsed["last"].is_null(), "a missing price must not read as 0");
         assert_eq!(parsed["symbol"], "ES");
@@ -1492,7 +1603,7 @@ mod tests {
         let instrument = index.find("SAP", Some("DE")).unwrap();
 
         let parsed: serde_json::Value =
-            serde_json::from_str(&entry_json(&store, &provider, instrument)).unwrap();
+            serde_json::from_str(&entry_json(&store, Some(&provider), instrument)).unwrap();
         assert_eq!(parsed["symbol"], "SAP", "the ticker alone, for looking it up again");
         assert_eq!(parsed["suffix"], "DE");
         assert_eq!(parsed["display"], "SAP.DE", "and the spelling people read");
@@ -1520,7 +1631,7 @@ mod tests {
         store.write_bars(&key, Timeframe::days(1), &bars);
 
         let parsed: serde_json::Value =
-            serde_json::from_str(&entry_json(&store, &provider, instrument)).unwrap();
+            serde_json::from_str(&entry_json(&store, Some(&provider), instrument)).unwrap();
         let spark = parsed["spark"].as_array().unwrap();
         assert_eq!(spark.len(), SPARK_POINTS);
         assert_eq!(spark.last().unwrap().as_f64().unwrap(), 99.0, "the tail, not the start");
@@ -1533,7 +1644,7 @@ mod tests {
         let index = SearchIndex::new(omacharts_engine::symbols::seed());
         let instrument = index.find("ES", None).unwrap();
         let parsed: serde_json::Value =
-            serde_json::from_str(&entry_json(&store, &provider, instrument)).unwrap();
+            serde_json::from_str(&entry_json(&store, Some(&provider), instrument)).unwrap();
         assert!(parsed["spark"].is_null(), "an absent series beats an empty one");
     }
 
@@ -1556,7 +1667,7 @@ mod tests {
         store.write_bars(&key, Timeframe::days(1), &[bar(86_400, 100.0), bar(172_800, 110.0)]);
 
         let parsed: serde_json::Value =
-            serde_json::from_str(&entry_json(&store, &provider, instrument)).unwrap();
+            serde_json::from_str(&entry_json(&store, Some(&provider), instrument)).unwrap();
         assert_eq!(parsed["last"].as_f64().unwrap(), 110.0);
         assert_eq!(parsed["change"].as_f64().unwrap(), 10.0);
         assert!((parsed["changePct"].as_f64().unwrap() - 10.0).abs() < 1e-6);
@@ -1697,14 +1808,14 @@ mod tests {
         let closes = omacharts_engine::providers::yahoo::parse_spark(&body).unwrap();
         store.write_closes(key, &closes[0]);
 
-        let q = quote_at(&store, key).unwrap();
+        let eurusd = Instrument { kind: omacharts_engine::InstrumentKind::Fx, ..listed("EURUSD") };
+        let q = quote_at(&store, key, &eurusd).unwrap();
         assert_eq!(q.last, 1.1217);
         assert!((q.change - 0.0013).abs() < 1e-9, "against Wednesday, not today: {}", q.change);
         assert_eq!(q.as_of, thursday);
 
-        let eurusd = Instrument { kind: omacharts_engine::InstrumentKind::Fx, ..listed("EURUSD") };
         let parsed: serde_json::Value =
-            serde_json::from_str(&entry_json(&store, &Yahoo::new(), &eurusd)).unwrap();
+            serde_json::from_str(&entry_json(&store, Some(&Yahoo::new()), &eurusd)).unwrap();
         let spark: Vec<f64> =
             parsed["spark"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
         assert_eq!(spark, vec![1.116, 1.1204, 1.1217], "today once, at the batch's price");
@@ -1714,7 +1825,7 @@ mod tests {
         store.write_bars(key, Timeframe::days(1), &fresher);
         store.backdate(key, Timeframe::days(1), thursday + 7_200);
         store.backdate_closes(key, thursday + 60);
-        assert_eq!(quote_at(&store, key).unwrap().last, 1.1220);
+        assert_eq!(quote_at(&store, key, &eurusd).unwrap().last, 1.1220);
     }
 
     /// FX's session opens at London midnight: 23:00 UTC in summer, 00:00 in
@@ -1733,12 +1844,13 @@ mod tests {
     fn a_batch_missing_a_session_takes_the_previous_close_from_the_bars() {
         let store = Store::memory().unwrap();
         let key = "yahoo:BTC-USD";
+        let coin = Instrument { kind: omacharts_engine::InstrumentKind::Crypto, ..listed("BTC") };
         let bar = |day: i64, close| omacharts_engine::Bar { ts: day * 86_400, open: close, high: close, low: close, close, volume: 1.0 };
         store.write_bars(key, Timeframe::days(1), &[bar(1, 100.0), bar(2, 110.0)]);
         store.write_closes(key, &omacharts_engine::Closes {
             symbol: "BTC-USD".into(), last: 111.0, previous: 100.0, at: 3 * 86_400, previous_at: 86_400,
         });
-        let q = quote_at(&store, key).unwrap();
+        let q = quote_at(&store, key, &coin).unwrap();
         assert_eq!((q.last, q.change), (111.0, 1.0), "against day 2's close, not day 1's");
 
         // With no gap the batch's own previous close stands, though the bars
@@ -1746,7 +1858,66 @@ mod tests {
         store.write_closes(key, &omacharts_engine::Closes {
             symbol: "BTC-USD".into(), last: 111.0, previous: 109.0, at: 3 * 86_400, previous_at: 2 * 86_400,
         });
-        assert_eq!(quote_at(&store, key).unwrap().change, 2.0);
+        assert_eq!(quote_at(&store, key, &coin).unwrap().change, 2.0);
+    }
+
+    /// A chart's intraday close stands in for the latest one when it was
+    /// fetched later, while its market traded, and falls in the same trading
+    /// day, in the part of it a daily bar holds.
+    #[test]
+    fn a_chart_fetched_later_moves_the_quote() {
+        use omacharts_engine::InstrumentKind::{Crypto, FutureRoot};
+        let gc = Instrument { kind: FutureRoot, ..listed("GC") };
+        let btc = Instrument { kind: Crypto, ..listed("BTC") };
+        let adbe = listed("ADBE");
+        let shel = Instrument { suffix: Some("L".into()), currency: Some("GBP".into()), ..listed("SHEL") };
+        // Tuesday 2026-11-03, as each market stamps its day: GC at midnight
+        // in New York, a coin at midnight UTC, ADBE at its open, SHEL.L at its.
+        let tue = 1_793_664_000;
+        let (gc_tue, us_tue, lse_tue) = (tue + 5 * 3_600, tue + 52_200, tue + 8 * 3_600);
+        let h = 3_600;
+        // (case, instrument, key, daily closes, daily fetched, batch a
+        // session past them as (last, previous, fetched), hourly bar,
+        // hourly fetched, expected (last, change))
+        type Case<'a> = (&'a str, &'a Instrument, &'a str, [(i64, f64); 2], i64, Option<(f64, f64, i64)>, (i64, f64), i64, (f64, f64));
+        let cases: [Case; 9] = [
+            ("chart after the daily bars", &gc, "yahoo:GC=F", [(gc_tue - 86_400, 3969.6), (gc_tue, 3918.4)], gc_tue + 30_000,
+             None, (gc_tue + 33_600, 3959.2), gc_tue + 33_700, (3959.2, 3959.2 - 3969.6)),
+            ("daily bars after the chart", &gc, "yahoo:GC=F", [(gc_tue - 86_400, 3969.6), (gc_tue, 3918.4)], gc_tue + 34_000,
+             None, (gc_tue + 33_600, 3959.2), gc_tue + 33_700, (3918.4, 3918.4 - 3969.6)),
+            ("future's evening is the next day", &gc, "yahoo:GC=F", [(gc_tue - 86_400, 3969.6), (gc_tue, 3959.8)], gc_tue + 50_000,
+             None, (tue + 23 * h, 3990.0), tue + 23 * h + 600, (3959.8, 3959.8 - 3969.6)),
+            ("coin late in the UTC day", &btc, "yahoo:BTC-USD", [(tue - 86_400, 100.0), (tue, 101.0)], tue + h,
+             None, (tue + 22 * h, 104.0), tue + 22 * h + 60, (104.0, 4.0)),
+            ("chart after the batch", &btc, "yahoo:BTC-USD", [(tue - 86_400, 76_000.0), (tue, 77_000.0)], tue + 34_000,
+             Some((78_050.0, 77_345.0, tue + 86_400 + 26_695)), (tue + 86_400 + 25_200, 78_100.0), tue + 86_400 + 26_878, (78_100.0, 755.0)),
+            ("batch after the chart", &btc, "yahoo:BTC-USD", [(tue - 86_400, 76_000.0), (tue, 77_000.0)], tue + 34_000,
+             Some((78_050.0, 77_345.0, tue + 86_400 + 27_000)), (tue + 86_400 + 25_200, 78_100.0), tue + 86_400 + 26_878, (78_050.0, 705.0)),
+            ("share in regular hours", &adbe, "yahoo:ADBE", [(us_tue - 86_400, 100.0), (us_tue, 101.0)], us_tue + h,
+             None, (tue + 20 * h + 1_800, 102.0), tue + 20 * h + 2_700, (102.0, 2.0)),
+            ("share's post-market", &adbe, "yahoo:ADBE", [(us_tue - 86_400, 100.0), (us_tue, 101.0)], us_tue + h,
+             None, (tue + 21 * h, 103.0), tue + 21 * h + 300, (101.0, 1.0)),
+            ("fetched after the close", &shel, "yahoo:SHEL.L", [(lse_tue - 86_400, 100.0), (lse_tue, 101.0)], lse_tue + h,
+             None, (tue + 16 * h, 99.0), tue + 17 * h + 1_800, (101.0, 1.0)),
+        ];
+        let bar = |(ts, close): (i64, f64)| omacharts_engine::Bar { ts, open: close, high: close, low: close, close, volume: 1.0 };
+        let hourly = Timeframe::parse("1h").unwrap();
+        for (case, instrument, key, daily, daily_fetched, batch, intraday, intraday_fetched, (last, change)) in cases {
+            let store = Store::memory().unwrap();
+            store.write_bars(key, Timeframe::days(1), &daily.map(bar));
+            store.backdate(key, Timeframe::days(1), daily_fetched);
+            if let Some((last, previous, fetched)) = batch {
+                let (symbol, previous_at) = (instrument.symbol.clone(), daily[1].0);
+                let at = previous_at + 86_400;
+                store.write_closes(key, &omacharts_engine::Closes { symbol, last, previous, at, previous_at });
+                store.backdate_closes(key, fetched);
+            }
+            store.write_bars(key, hourly, &[bar(intraday)]);
+            store.backdate(key, hourly, intraday_fetched);
+            let q = quote_at(&store, key, instrument).unwrap();
+            assert_eq!(q.last, last, "{case}");
+            assert!((q.change - change).abs() < 1e-9, "{case}: change {}", q.change);
+        }
     }
 
     #[test]

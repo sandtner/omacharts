@@ -191,7 +191,7 @@ impl Dock {
         header.append(&fit);
         let close = gtk::Button::from_icon_name("window-close-symbolic");
         close.add_css_class("flat");
-        close.set_tooltip_text(Some("Close the backtest (Ctrl+Shift+B)"));
+        close.set_tooltip_text(Some("Close the backtest (Ctrl+Shift+T)"));
         header.append(&close);
         root.append(&header);
         root.append(&gtk::Separator::new(gtk::Orientation::Horizontal));

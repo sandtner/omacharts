@@ -2,7 +2,7 @@
 //!
 //! A theme is every colour the app wears, candles included; once it is yours
 //! to edit, every one of them is a row on the Theme page. How candles are
-//! painted from those colours — filled, hollow, red up, monochrome — is a
+//! painted from those colours — vivid, soft, quiet, monochrome — is a
 //! chart setting, and lives under Charts.
 //!
 //! Built-ins and the Omarchy theme are not editable in place. "Customize"
@@ -30,9 +30,35 @@ use crate::ui::window::Window;
 
 pub struct Preferences;
 
+/// What opens the dialog at the Trading section rather than at a tab of
+/// Charts.
+pub const TRADING: &str = "trading";
+
 /// The sidebar plus the column a preferences page lays its rows in, with
 /// room either side of it.
 const MAX_WIDTH: i32 = 980;
+
+/// Where the dialog was when it was last looked at, for this run of the app:
+/// the section down the sidebar, by its place, and the tab shown in Charts.
+/// Opening the dialog again goes back there, so somebody adjusting one row
+/// over and over does not have to find it each time. Not kept across
+/// restarts.
+#[derive(Clone, Default)]
+struct Seen {
+    section: usize,
+    charts_tab: Option<String>,
+}
+
+thread_local! {
+    static LAST_SEEN: RefCell<Seen> = RefCell::new(Seen::default());
+}
+
+/// Have the dialog open next at the Theme section, for a test that reads
+/// what is on it.
+#[cfg(test)]
+pub(crate) fn open_next_at_theme() {
+    LAST_SEEN.with(|seen| seen.borrow_mut().section = 2);
+}
 
 struct Context {
     store: Rc<Store>,
@@ -50,6 +76,7 @@ struct Context {
     charts_other_page: adw::PreferencesPage,
     charts_templates_page: adw::PreferencesPage,
     data_page: adw::PreferencesPage,
+    trading_page: adw::PreferencesPage,
     groups: RefCell<Vec<adw::PreferencesGroup>>,
     /// The window, for the chart templates: they are shown on its charts,
     /// and only it knows which of its charts are using one.
@@ -73,6 +100,12 @@ impl Preferences {
         window: Rc<Window>,
         charts_tab: Option<&str>,
     ) {
+        // Trading is a section, not a tab of Charts, and is asked for by the
+        // same word: from a chart's account list.
+        let (charts_tab, at_trading) = match charts_tab {
+            Some(TRADING) => (None, true),
+            tab => (tab, false),
+        };
         let dialog = adw::Dialog::new();
         dialog.set_title("Preferences");
         // The breakpoint below needs a floor to measure against.
@@ -89,6 +122,7 @@ impl Preferences {
         let general_page = adw::PreferencesPage::new();
         let charts_page = adw::PreferencesPage::new();
         let data_page = adw::PreferencesPage::new();
+        let trading_page = adw::PreferencesPage::new();
 
         // General first: what the app does, before what it looks like.
         // Charts is four things: what a new chart opens with, the sets of
@@ -104,30 +138,53 @@ impl Preferences {
         let charts_header_page = adw::PreferencesPage::new();
         let store_for_header = store.clone();
         let window_for_header = window.clone();
-        let header = crate::ui::part_list::PartList::new(
-            "In the header",
-            "Add to the header",
-            crate::header::load(&store),
-            move |parts| {
-                crate::header::save(&store_for_header, &parts);
-                window_for_header.apply_header();
-            },
-        );
-        charts_header_page.add(&header.group);
+        // The account, Buy and Sell, the quantity and the day's P&L are
+        // listed and offered while trading is switched on, with or without
+        // a login, like every trading setting: they draw nothing on a chart
+        // until there is an account to trade on. Switched off, they are
+        // neither listed nor offered, and stay where they were.
+        let (sections, restore_header) = header_sections(crate::header::load(&store), move |header| {
+            crate::header::save(&store_for_header, header);
+            window_for_header.apply_header();
+        });
+        for section in &sections {
+            charts_header_page.add(&section.group);
+        }
+        let restore_group = adw::PreferencesGroup::new();
+        let restore = gtk::Button::with_label("Restore defaults");
+        restore.set_halign(gtk::Align::Start);
+        restore.connect_clicked(move |_| restore_header());
+        restore_group.add(&restore);
+        charts_header_page.add(&restore_group);
         charts.add_titled(&charts_header_page, Some("header"), "Header");
         charts.add_titled(&charts_other_page, Some("other"), "Other");
-        // Opened from something on a chart, at the tab that is about it.
-        if let Some(tab) = charts_tab {
-            charts.set_visible_child_name(tab);
+        // Opened from something on a chart, at the tab that is about it;
+        // otherwise where it was left.
+        let last = LAST_SEEN.with(|seen| seen.borrow().clone());
+        if let Some(tab) = charts_tab.map(str::to_string).or(last.charts_tab) {
+            charts.set_visible_child_name(&tab);
         }
+        charts.connect_visible_child_name_notify(|charts| {
+            let tab = charts.visible_child_name().map(|name| name.to_string());
+            LAST_SEEN.with(|seen| seen.borrow_mut().charts_tab = tab);
+        });
 
-        let sections: [(&str, &str, gtk::Widget); 4] = [
+        let mut sections: Vec<(&str, &str, gtk::Widget)> = vec![
             ("General", "preferences-system-symbolic", general_page.clone().upcast()),
             ("Charts", "utilities-system-monitor-symbolic", charts.upcast()),
             ("Theme", "applications-graphics-symbolic", page.clone().upcast()),
             ("Data", "network-server-symbolic", data_page.clone().upcast()),
         ];
-        let start = if charts_tab.is_some() { 1 } else { 0 };
+        // Trading's page only while trading is switched on.
+        let trading = crate::features::trading();
+        if trading {
+            sections.push(("Trading", "view-list-bullet-symbolic", trading_page.clone().upcast()));
+        }
+        let start = match (charts_tab, at_trading && trading) {
+            (_, true) => sections.len() - 1,
+            (Some(_), _) => 1,
+            (None, _) => last.section.min(sections.len() - 1),
+        };
         dialog.set_child(Some(&split_view(&dialog, &sections, start)));
 
         let context = Rc::new(Context {
@@ -142,6 +199,7 @@ impl Preferences {
             charts_other_page,
             charts_templates_page,
             data_page,
+            trading_page,
             groups: RefCell::new(Vec::new()),
             window,
             templates_group: RefCell::new(None),
@@ -152,6 +210,82 @@ impl Preferences {
 
         dialog.present(Some(parent));
     }
+}
+
+/// The header's sections, a list each, handing every change to `changed` as
+/// the whole header.
+///
+/// A part is in the header once, so a part in one section is not offered by
+/// the other's +, and is offered again the moment it is taken out.
+///
+/// Comes with the way back to the standard header, every section at once.
+#[allow(clippy::type_complexity)]
+fn header_sections(
+    current: crate::header::Header,
+    changed: impl Fn(&crate::header::Header) + 'static,
+) -> (Vec<Rc<crate::ui::part_list::PartList<crate::header::Part>>>, Rc<dyn Fn()>) {
+    use crate::header::Section;
+    use crate::ui::part_list::PartList;
+    type Lists = Rc<RefCell<Vec<(Section, std::rc::Weak<PartList<crate::header::Part>>)>>>;
+    let header = Rc::new(RefCell::new(current));
+    let changed = Rc::new(changed);
+    let lists: Lists = Rc::new(RefCell::new(Vec::new()));
+    let elsewhere = Rc::new(move |header: &crate::header::Header, section: Section| -> Vec<crate::header::Part> {
+        Section::ALL
+            .into_iter()
+            .filter(|other| *other != section)
+            .flat_map(|other| header.section(other).to_vec())
+            .collect()
+    });
+    let built: Vec<_> = Section::ALL
+        .into_iter()
+        .map(|section| {
+            let (edited, changed, others) = (header.clone(), changed.clone(), lists.clone());
+            let elsewhere_now = elsewhere.clone();
+            // Trading's parts while it is switched off are neither listed
+            // nor lost: they stay where they were for when it is on.
+            let current = header.borrow().shown(section, crate::features::trading());
+            let list = PartList::new(
+                section.title(),
+                &format!("Add to the {}", section.title().to_lowercase()),
+                current,
+                move |parts: Vec<crate::header::Part>| {
+                    edited.borrow_mut().set_shown(section, parts, crate::features::trading());
+                    let now = edited.borrow().clone();
+                    for (other, list) in others.borrow().iter().filter(|(other, _)| *other != section) {
+                        if let Some(list) = list.upgrade() {
+                            list.set_elsewhere(elsewhere_now(&now, *other));
+                        }
+                    }
+                    changed(&now);
+                },
+            );
+            list.set_elsewhere(elsewhere(&header.borrow(), section));
+            lists.borrow_mut().push((section, Rc::downgrade(&list)));
+            list
+        })
+        .collect();
+    // Kept by their groups, which let go when the dialog is disposed: a
+    // section with no rows and nothing to offer holds nothing that would.
+    for list in &built {
+        let kept = built.clone();
+        list.group.connect_destroy(move |_| {
+            let _ = &kept;
+        });
+    }
+    let shown: Vec<_> = built.iter().map(Rc::downgrade).collect();
+    let restore = Rc::new(move || {
+        let standard = crate::header::Header::standard();
+        *header.borrow_mut() = standard.clone();
+        for (section, list) in Section::ALL.into_iter().zip(&shown) {
+            if let Some(list) = list.upgrade() {
+                list.replace(standard.shown(section, crate::features::trading()));
+                list.set_elsewhere(elsewhere(&standard, section));
+            }
+        }
+        changed(&standard);
+    });
+    (built, restore)
 }
 
 /// The sections down a sidebar, the selected one beside it.
@@ -208,6 +342,9 @@ fn split_view(
         let Some(page) = row.and_then(|row| pages.get(row.index() as usize)) else {
             return;
         };
+        if let Some(row) = row {
+            LAST_SEEN.with(|seen| seen.borrow_mut().section = row.index() as usize);
+        }
         content.replace(std::slice::from_ref(page));
         view.set_show_content(true);
     });
@@ -241,6 +378,9 @@ fn rebuild(context: &Rc<Context>) {
     if theme.source.is_editable() {
         let [backgrounds, text, other] = UiSlot::GROUPS;
         groups.push(bar_colors_group(context));
+        if crate::features::trading() {
+            groups.push(trading_look_group(context));
+        }
         groups.push(theme_colors_group(context, backgrounds));
         groups.push(theme_colors_group(context, text));
         groups.push(palette_group(context));
@@ -254,8 +394,10 @@ fn rebuild(context: &Rc<Context>) {
 }
 
 /// A way to the resolution list from the settings, since the other way in is
-/// right-clicking a strip, which you have to know about to find.
-fn resolutions_group(context: &Rc<Context>) -> adw::PreferencesGroup {
+/// right-clicking a strip, which you have to know about to find; the one
+/// switch about how the charts behave towards each other; and how far they
+/// zoom to the wheel and the touchpad.
+fn chart_group(context: &Rc<Context>) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::new();
     group.set_title("Chart");
 
@@ -273,7 +415,59 @@ fn resolutions_group(context: &Rc<Context>) -> adw::PreferencesGroup {
     row.connect_activated(move |_| edit());
 
     group.add(&row);
+
+    // One switch for the app rather than one per chart, and nothing to do
+    // with how a chart is linked to the watchlist: two charts of the same
+    // symbol are two looks at the same moment, whichever list moves them.
+    let sync = adw::ActionRow::new();
+    sync.set_title("Sync crosshair across charts");
+    let switch = gtk::Switch::new();
+    switch.set_valign(gtk::Align::Center);
+    switch.set_active(context.store.setting_bool(crate::ui::window::SETTING_SYNC_CROSSHAIR, true));
+    let store = context.store.clone();
+    let window = context.window.clone();
+    switch.connect_state_set(move |_, on| {
+        store.set_setting_bool(crate::ui::window::SETTING_SYNC_CROSSHAIR, on);
+        if !on {
+            window.clear_echoes();
+        }
+        glib::Propagation::Proceed
+    });
+    sync.add_suffix(&switch);
+    sync.set_activatable_widget(Some(&switch));
+    group.add(&sync);
+
+    group.add(&zoom_row(context));
+
     group
+}
+
+/// How far the wheel and a two-finger swipe zoom, for every chart, as a
+/// percentage of the base rate. Read by the charts on every scroll, so a
+/// change is felt on the next one. The mark is where it started.
+fn zoom_row(context: &Rc<Context>) -> adw::ActionRow {
+    use crate::zoom::{DEFAULT, MAX, MIN};
+    let row = adw::ActionRow::new();
+    row.set_title("Zoom sensitivity");
+    let scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, MIN as f64, MAX as f64, 5.0);
+    scale.set_size_request(180, -1);
+    scale.set_valign(gtk::Align::Center);
+    scale.set_draw_value(true);
+    scale.set_value_pos(gtk::PositionType::Left);
+    scale.set_digits(0);
+    scale.set_round_digits(0);
+    scale.set_format_value_func(|_, v| format!("{v:.0}%"));
+    scale.add_mark(DEFAULT as f64, gtk::PositionType::Bottom, None);
+    scale.set_value(crate::zoom::sensitivity(&context.store) as f64);
+    let store = context.store.clone();
+    scale.connect_value_changed(move |scale| {
+        let percent = scale.value().round() as u32;
+        if percent != crate::zoom::sensitivity(&store) {
+            crate::zoom::save(&store, percent);
+        }
+    });
+    row.add_suffix(&scale);
+    row
 }
 
 fn theme_group(context: &Rc<Context>) -> adw::PreferencesGroup {
@@ -411,37 +605,87 @@ fn build_charts_page(context: &Rc<Context>) {
 
     let colouring = adw::ComboRow::new();
     colouring.set_title("Colouring");
-    crate::ui::chart_settings::fill_colourings(&colouring, current.bar_style, current.colouring);
+    crate::ui::chart_settings::fill_colourings(&colouring, current.colouring);
 
+    // The two switches worn over the colouring: the hollow rise greyed on
+    // OHLC bars, which have no body to leave open, and the swap on a
+    // colouring that paints the same either way.
+    let hollow = adw::SwitchRow::new();
+    hollow.set_title(crate::ui::chart_settings::HOLLOW_LABEL);
+    hollow.set_active(current.hollow_up);
+    hollow.set_sensitive(crate::ui::chart_settings::hollow_applies(current.bar_style));
+    let swapped = adw::SwitchRow::new();
+    swapped.set_title(crate::ui::chart_settings::SWAP_LABEL);
+    swapped.set_active(current.swapped);
+    let theme = context.theming.borrow().theme();
+    swapped.set_sensitive(crate::ui::chart_settings::two_toned(&theme, current.colouring));
+
+    // How thick OHLC bars are drawn, offered only while they are the style.
+    let thickness = {
+        let changed = changed.clone();
+        crate::ui::controls::bounded_row(
+            crate::ui::chart_settings::THICKNESS_LABEL,
+            None,
+            f64::from(current.ohlc_thickness),
+            f64::from(crate::chart_defaults::MIN_OHLC_THICKNESS),
+            f64::from(crate::chart_defaults::MAX_OHLC_THICKNESS),
+            1.0,
+            0,
+            move |px| {
+                let px = px.round() as u8;
+                changed(&|d| d.ohlc_thickness = px);
+            },
+        )
+        .row
+    };
+    thickness.set_visible(current.bar_style == BarStyle::Ohlc);
     {
         let changed = changed.clone();
-        let colouring = colouring.clone();
-        let defaults = defaults.clone();
+        let hollow = hollow.clone();
+        let thickness = thickness.clone();
         style.connect_selected_notify(move |row| {
             let Some(chosen) = BarStyle::ALL.get(row.selected() as usize).copied() else { return };
             changed(&|d| d.bar_style = chosen);
-            crate::ui::chart_settings::fill_colourings(&colouring, chosen, defaults.get().colouring);
+            hollow.set_sensitive(crate::ui::chart_settings::hollow_applies(chosen));
+            thickness.set_visible(chosen == BarStyle::Ohlc);
         });
     }
     {
         let changed = changed.clone();
         let defaults = defaults.clone();
+        let swapped = swapped.clone();
         colouring.connect_selected_notify(move |row| {
             if crate::ui::chart_settings::filling_colourings(row) {
                 return;
             }
-            let style = defaults.get().bar_style;
-            let Some(chosen) = BarColouring::offered(style).get(row.selected() as usize).copied()
-            else {
+            let Some(chosen) = BarColouring::ALL.get(row.selected() as usize).copied() else {
                 return;
             };
-            if chosen != defaults.get().colouring.for_style(style) {
+            if chosen != defaults.get().colouring {
                 changed(&|d| d.colouring = chosen);
             }
+            swapped.set_sensitive(crate::ui::chart_settings::two_toned(&theme, chosen));
+        });
+    }
+    {
+        let changed = changed.clone();
+        hollow.connect_active_notify(move |row| {
+            let on = row.is_active();
+            changed(&|d| d.hollow_up = on);
+        });
+    }
+    {
+        let changed = changed.clone();
+        swapped.connect_active_notify(move |row| {
+            let on = row.is_active();
+            changed(&|d| d.swapped = on);
         });
     }
     bars.add(&style);
+    bars.add(&thickness);
     bars.add(&colouring);
+    bars.add(&hollow);
+    bars.add(&swapped);
 
     let session = adw::ComboRow::new();
     session.set_title("Hours");
@@ -744,6 +988,92 @@ fn bar_colors_group(context: &Rc<Context>) -> adw::PreferencesGroup {
     group
 }
 
+/// How orders and positions are drawn on a chart: a colour for each of buy,
+/// sell, long, short, profit and loss, and a pattern for each kind of line.
+/// Only on a theme of somebody's own, like the bars, and each row saves
+/// only itself: what nobody set keeps following the theme. There while
+/// trading is switched on, with or without a login, as every trading
+/// setting is: without one nothing draws in it.
+fn trading_look_group(context: &Rc<Context>) -> adw::PreferencesGroup {
+    use omacharts_engine::indicators::LineStyle;
+    use omacharts_engine::{TradingColour, TradingLine, TradingLook};
+
+    let group = adw::PreferencesGroup::new();
+    group.set_title("Trading");
+    let theme = context.theming.borrow().theme();
+    let swapped = context.theming.borrow().swapped();
+    let shown = omacharts_engine::theme_trading(&theme, swapped);
+    // Change the theme's own look by `edit`, and nothing else in it.
+    let save = |ctx: &Rc<Context>, edit: &dyn Fn(&mut TradingLook)| {
+        let mut theme = ctx.theming.borrow().theme();
+        if !theme.source.is_editable() {
+            return;
+        }
+        let mut look = omacharts_engine::editable_trading(&theme);
+        edit(&mut look);
+        theme.trading = Some(Box::new(look));
+        ctx.store.save_theme(&theme);
+        ctx.theming.borrow_mut().reload_custom(&ctx.store);
+        apply(ctx);
+    };
+
+    for slot in TradingColour::ALL {
+        let row = adw::ActionRow::new();
+        row.set_title(slot.label());
+        let button = color_button(shown.colour(slot));
+        let ctx = context.clone();
+        button.connect_rgba_notify(move |button| {
+            let rgba = button.rgba();
+            let hex = format!(
+                "#{:02x}{:02x}{:02x}",
+                (rgba.red() * 255.0).round() as u8,
+                (rgba.green() * 255.0).round() as u8,
+                (rgba.blue() * 255.0).round() as u8,
+            );
+            save(&ctx, &|look| *look.colour_mut(slot) = Some(omacharts_engine::ColorChoice::Fixed { hex: hex.clone() }));
+        });
+        row.add_suffix(&button);
+        group.add(&row);
+    }
+
+    let ink = {
+        let text = theme.ui.text.clone();
+        crate::ui::chart_settings::Ink::new(move || text.clone())
+    };
+    for slot in TradingLine::ALL {
+        let row = adw::ActionRow::new();
+        row.set_title(slot.label());
+        let strip = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        strip.add_css_class("linked");
+        strip.add_css_class("stroke-picker");
+        strip.set_valign(gtk::Align::Center);
+        let mut first: Option<gtk::ToggleButton> = None;
+        for style in LineStyle::ALL {
+            let button = gtk::ToggleButton::new();
+            button.add_css_class("flat");
+            button.set_tooltip_text(Some(style.label()));
+            let sample =
+                crate::ui::chart_settings::stroke_sample(crate::ui::chart_settings::LINE_SAMPLE_WIDTH, style, &ink);
+            button.set_child(Some(&sample));
+            match &first {
+                Some(anchor) => button.set_group(Some(anchor)),
+                None => first = Some(button.clone()),
+            }
+            button.set_active(style == shown.line(slot));
+            let ctx = context.clone();
+            button.connect_toggled(move |button| {
+                if button.is_active() {
+                    save(&ctx, &|look| *look.line_mut(slot) = Some(style));
+                }
+            });
+            strip.append(&button);
+        }
+        row.add_suffix(&strip);
+        group.add(&row);
+    }
+    group
+}
+
 /// Everything that is not about how the app looks: what the charts offer, and
 /// where their data comes from.
 fn build_general_page(context: &Rc<Context>) {
@@ -754,8 +1084,9 @@ fn build_general_page(context: &Rc<Context>) {
         context.general_page.add(&group);
     }
     context.charts_other_page.add(&time_group(context));
-    context.charts_other_page.add(&resolutions_group(context));
+    context.charts_other_page.add(&chart_group(context));
     context.general_page.add(&screenshots_group(context));
+    context.general_page.add(&updates_group(context));
     build_charts_page(context);
     rebuild_templates(context);
     build_data_page(context);
@@ -1001,6 +1332,22 @@ fn confirm_delete_template(context: &Rc<Context>, anchor: &gtk::Button, id: u32,
 /// Both rows derive their state rather than reading something written down at
 /// install time: nothing is stored until somebody changes it, so the day the
 /// default folder moves, everyone who never chose moves with it.
+/// Whether newer releases are downloaded behind the window. Off stops the
+/// asking and leaves what is already downloaded in place: it is newer than
+/// what pacman installed, and settings it has migrated would not open in an
+/// older version.
+fn updates_group(context: &Rc<Context>) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::new();
+    group.set_title("Updates");
+    let row = adw::SwitchRow::new();
+    row.set_title("Update automatically");
+    row.set_active(context.store.setting_bool(crate::update::SETTING, true));
+    let store = context.store.clone();
+    row.connect_active_notify(move |row| store.set_setting_bool(crate::update::SETTING, row.is_active()));
+    group.add(&row);
+    group
+}
+
 fn screenshots_group(context: &Rc<Context>) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::new();
     group.set_title("Screenshots");
@@ -1163,12 +1510,37 @@ fn build_data_page(context: &Rc<Context>) {
     });
     group.add(&limit);
 
-    crate::ui::feed_settings::build(
+    // Trading switched off has no Trading page, and the Data page adds a
+    // broker's data feed through the broker's own dialog itself.
+    if !crate::features::trading() {
+        crate::ui::feed_settings::build(
+            &context.data_page,
+            context.store.clone(),
+            context.on_change.clone(),
+            vec![group, backups_group(context)],
+            Rc::new(|_: &str, _: &gtk::Widget| {}),
+        );
+        return;
+    }
+    let trading = crate::ui::trading_settings::build(
+        &context.trading_page,
+        context.store.clone(),
+        context.window.desk(),
+        context.on_change.clone(),
+    );
+    let window = context.window.clone();
+    trading.set_edit_sizes(Rc::new(move |anchor: &gtk::Widget| window.edit_trading_sizes(anchor)));
+    let window = context.window.clone();
+    trading.set_labels_moved(Rc::new(move || window.adopt_order_labels()));
+    let adding = trading.clone();
+    let redraw = crate::ui::feed_settings::build(
         &context.data_page,
         context.store.clone(),
         context.on_change.clone(),
         vec![group, backups_group(context)],
+        Rc::new(move |broker: &str, anchor: &gtk::Widget| crate::ui::trading_settings::add_broker(&adding, broker, anchor)),
     );
+    trading.redraw_data_page(redraw);
 }
 
 /// When the settings were last backed up, and the way back to any backup.
@@ -1494,8 +1866,27 @@ pub(crate) fn ask_name(
     verb: &str,
     done: impl Fn(String) + 'static,
 ) {
+    ask_for_text(anchor, heading, "Name", initial, verb, false, done);
+}
+
+/// A chart's title, asked for the way a name is, under its own word: blank is
+/// an answer, and leaves the chart untitled.
+pub(crate) fn ask_title(anchor: &impl IsA<gtk::Widget>, initial: &str, done: impl Fn(String) + 'static) {
+    ask_for_text(anchor, "Chart title", "Title", initial, "Save", true, done);
+}
+
+fn ask_for_text(
+    anchor: &impl IsA<gtk::Widget>,
+    heading: &str,
+    label: &str,
+    initial: &str,
+    verb: &str,
+    blank_ok: bool,
+    done: impl Fn(String) + 'static,
+) {
+    let answers = move |text: &str| blank_ok || !text.trim().is_empty();
     let name = adw::EntryRow::new();
-    name.set_title("Name");
+    name.set_title(label);
     name.set_text(initial);
     let rows = adw::PreferencesGroup::new();
     rows.add(&name);
@@ -1508,17 +1899,17 @@ pub(crate) fn ask_name(
     dialog.set_default_response(Some("ok"));
     dialog.set_close_response("cancel");
     // Offered blank, for a new name, it cannot be answered until it is not.
-    dialog.set_response_enabled("ok", !initial.trim().is_empty());
+    dialog.set_response_enabled("ok", answers(initial));
 
     let gate = dialog.clone();
     name.connect_changed(move |field| {
-        gate.set_response_enabled("ok", !field.text().trim().is_empty());
+        gate.set_response_enabled("ok", answers(&field.text()));
     });
     // An entry row keeps Return for itself; typing a name and pressing it is
     // one gesture and should finish the one thing.
     let finish = dialog.clone();
     name.connect_entry_activated(move |field| {
-        if !field.text().trim().is_empty() {
+        if answers(&field.text()) {
             finish.emit_by_name::<()>("response", &[&"ok"]);
             finish.close();
         }
@@ -1595,6 +1986,92 @@ fn describe_count(series: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A part in one section is not offered by the others, and is offered
+    /// again once it is taken out; every change is the whole header.
+    #[test]
+    fn a_part_in_one_section_is_not_offered_in_the_others() {
+        use crate::header::{Header, Part};
+        crate::ui::on_gtk(|| {
+            crate::features::force(crate::features::Feature::Trading, true);
+            let saved: Rc<RefCell<Vec<Header>>> = Rc::default();
+            let seen = saved.clone();
+            let (sections, _) =
+                header_sections(Header::standard(), move |header| seen.borrow_mut().push(header.clone()));
+            let [left, center, right] = sections.as_slice() else { panic!("three sections") };
+            assert_eq!(left.group.title(), "Left");
+            assert_eq!(center.group.title(), "Center");
+            assert_eq!(right.group.title(), "Right");
+            assert_eq!(left.parts(), vec![Part::Feed, Part::Symbol, Part::Resolution, Part::Account]);
+            assert_eq!(center.parts(), vec![Part::Title]);
+            assert_eq!(right.parts(), vec![Part::DayPnl, Part::Trade, Part::Size, Part::Settings, Part::Maximize, Part::Link]);
+            assert_eq!(left.offered(), vec![Part::Change, Part::Template, Part::Stripe]);
+            assert_eq!(center.offered(), vec![Part::Change, Part::Template, Part::Stripe]);
+            assert_eq!(right.offered(), vec![Part::Change, Part::Template, Part::Stripe]);
+
+            // Out of the center, the title is offered by all three.
+            center.set(Vec::new());
+            assert_eq!(left.offered(), vec![Part::Change, Part::Template, Part::Title, Part::Stripe]);
+            assert_eq!(center.offered(), vec![Part::Change, Part::Template, Part::Title, Part::Stripe]);
+            assert_eq!(right.offered(), vec![Part::Change, Part::Template, Part::Title, Part::Stripe]);
+            // The stripe into the left is offered by none.
+            left.set(vec![Part::Symbol, Part::Stripe]);
+            assert_eq!(
+                center.offered(),
+                vec![Part::Resolution, Part::Change, Part::Template, Part::Title, Part::Account, Part::Feed]
+            );
+            assert!(!left.offered().contains(&Part::Stripe));
+            assert!(!right.offered().contains(&Part::Stripe));
+            assert_eq!(
+                saved.borrow().last(),
+                Some(&Header {
+                    left: vec![Part::Symbol, Part::Stripe],
+                    center: Vec::new(),
+                    right: vec![Part::DayPnl, Part::Trade, Part::Size, Part::Settings, Part::Maximize, Part::Link]
+                })
+            );
+            // The corner's controls move like any other part: the gear out
+            // of the right is offered by the left, and put there is offered
+            // by neither until it is taken out again.
+            right.set(vec![Part::Maximize, Part::Link]);
+            assert!(left.offered().contains(&Part::Settings));
+            left.set(vec![Part::Symbol, Part::Settings]);
+            assert!(!right.offered().contains(&Part::Settings));
+            assert_eq!(saved.borrow().last().map(|header| header.right.clone()), Some(vec![Part::Maximize, Part::Link]));
+            left.set(vec![Part::Symbol]);
+            assert!(right.offered().contains(&Part::Settings));
+        });
+    }
+
+    /// Restoring puts every section back as it ships, at once, lists and
+    /// offers included, and hands the whole header on once.
+    #[test]
+    fn restoring_the_header_puts_every_section_back() {
+        use crate::header::{Header, Part};
+        crate::ui::on_gtk(|| {
+            crate::features::force(crate::features::Feature::Trading, true);
+            let saved: Rc<RefCell<Vec<Header>>> = Rc::default();
+            let seen = saved.clone();
+            let moved = Header {
+                left: vec![Part::Change, Part::Settings, Part::Size],
+                center: Vec::new(),
+                right: vec![Part::Symbol, Part::Stripe],
+            };
+            let (sections, restore) =
+                header_sections(moved, move |header| seen.borrow_mut().push(header.clone()));
+            let [left, center, right] = sections.as_slice() else { panic!("three sections") };
+            restore();
+            assert_eq!(left.parts(), vec![Part::Feed, Part::Symbol, Part::Resolution, Part::Account]);
+            assert_eq!(center.parts(), vec![Part::Title]);
+            assert_eq!(right.parts(), vec![Part::DayPnl, Part::Trade, Part::Size, Part::Settings, Part::Maximize, Part::Link]);
+            assert_eq!(left.offered(), vec![Part::Change, Part::Template, Part::Stripe]);
+            assert_eq!(right.offered(), vec![Part::Change, Part::Template, Part::Stripe]);
+            assert_eq!(saved.borrow().as_slice(), &[Header::standard()]);
+            // And the lists go on from there.
+            center.set(Vec::new());
+            assert_eq!(saved.borrow().last().map(|header| header.left.clone()), Some(Header::standard().left));
+        });
+    }
 
     #[test]
     fn copies_get_ids_that_are_not_taken() {

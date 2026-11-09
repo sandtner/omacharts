@@ -228,31 +228,7 @@ pub fn run(plan: &Plan, request: &Request, bars: &[Bar], inputs: &Inputs) -> Res
     Ok(report)
 }
 
-/// One trade as a chart draws it.
-#[derive(Clone, PartialEq, Debug)]
-pub struct TradeMark {
-    pub entry_ts: i64,
-    pub exit_ts: i64,
-    pub entry: f64,
-    pub exit: f64,
-    pub stop: Option<f64>,
-    pub target: Option<f64>,
-    pub win: bool,
-    pub open: bool,
-    /// What the exit says: `+2.1R`, or `+3.4%` with no stop.
-    pub label: String,
-}
-
-/// What a chart lays over its bars after a backtest.
-#[derive(Clone, PartialEq, Debug, Default)]
-pub struct Marks {
-    /// The bars the backtest traded on, first and last.
-    pub from_ts: i64,
-    pub to_ts: i64,
-    pub trades: Vec<TradeMark>,
-    /// The trade picked in the list, drawn stronger.
-    pub selected: Option<usize>,
-}
+pub use omacharts_chart::overlays::{Marks, TradeMark};
 
 pub fn marks(report: &Report, bars: &[Bar]) -> Marks {
     let trades = report

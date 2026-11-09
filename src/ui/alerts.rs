@@ -300,14 +300,13 @@ fn table(window: &Rc<Window>, dialog: &adw::Dialog, all: &[Alert], alerts: &[&Al
     // first; expired last. The question the table is opened to answer is
     // "what is about to go off".
     let index = window.symbols();
-    let provider = window.provider();
     let mut rows: Vec<(&Alert, Option<f64>, usize, Option<f64>)> = alerts
         .iter()
         .map(|alert| {
             let instrument = index.as_ref().and_then(|i| i.find(&alert.symbol, alert.suffix.as_deref()));
             let level = level_now(window, alert);
             let last = instrument
-                .and_then(|i| crate::cli::quote(window.store(), provider.as_ref(), i))
+                .and_then(|i| window.quote(i))
                 .map(|q| q.last)
                 .or(alert.last);
             let scale = if alert.is_rule() { last.unwrap_or(alert.scale()) } else { level };

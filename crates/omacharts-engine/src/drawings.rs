@@ -409,13 +409,34 @@ pub enum Kind {
     /// [`Drawing::stop`] the third price. Long when the target is above the
     /// entry, short when below, and sized from the account's risk.
     Position,
+    /// A volume profile of the bars between its two anchors: a composite of
+    /// whatever span the hand dragged across. Only the times of its anchors
+    /// mean anything; how tall it is comes from the bars it covers. It is
+    /// not moved whole, since a profile somewhere else is a different
+    /// profile: its two edges change the span instead.
+    Profile,
+    /// A VWAP anchored at a bar: the volume-weighted average price from that
+    /// bar to the last one on the chart, growing as bars arrive. One anchor,
+    /// like a word, and only its moment means anything; the line's height
+    /// comes from the bars. Moved by its anchor alone, since moved whole it
+    /// would be a VWAP from another bar.
+    Vwap,
+    /// A Fibonacci retracement: a level at each of the ratios between its
+    /// two anchors' prices, drawn across the span they mark out. Dragged
+    /// from where a swing starts to where it ends, so 0 is the end and 1
+    /// the start, and a level reads as how far the move has been given
+    /// back. Moved whole, since unlike the two above it is drawn through
+    /// its anchors' prices.
+    Fib,
 }
 
 impl Kind {
     /// Every kind, in the order the tools are offered: the plain line
     /// first, then the two that are a line with one thing added, then the
-    /// shapes, then the words.
-    pub const ALL: [Kind; 8] = [
+    /// shapes, then the words, then the trade planned on the chart, then
+    /// the two that are read off the bars: the profile, and the anchored
+    /// VWAP under it; then the retracement, under the VWAP.
+    pub const ALL: [Kind; 11] = [
         Kind::Line,
         Kind::Horizontal,
         Kind::Arrow,
@@ -424,6 +445,9 @@ impl Kind {
         Kind::Ellipse,
         Kind::Text,
         Kind::Position,
+        Kind::Profile,
+        Kind::Vwap,
+        Kind::Fib,
     ];
 
     /// The kinds that are a shape, which is every kind that can carry text
@@ -451,6 +475,9 @@ impl Kind {
             Kind::Ellipse => "Circle",
             Kind::Text => "Text",
             Kind::Position => "Position",
+            Kind::Profile => "Volume profile",
+            Kind::Vwap => "Anchored VWAP",
+            Kind::Fib => "Fib retracement",
         }
     }
 
@@ -464,6 +491,9 @@ impl Kind {
             Kind::Ellipse => "ellipse",
             Kind::Text => "text",
             Kind::Position => "position",
+            Kind::Profile => "profile",
+            Kind::Vwap => "avwap",
+            Kind::Fib => "fib",
         }
     }
 
@@ -487,11 +517,58 @@ impl Kind {
                     .any(|name| key.eq_ignore_ascii_case(name))
                     .then_some(Kind::Position)
             })
+            .or_else(|| {
+                ["vp"]
+                    .iter()
+                    .any(|name| key.eq_ignore_ascii_case(name))
+                    .then_some(Kind::Profile)
+            })
+            .or_else(|| {
+                ["vwap", "anchored-vwap"]
+                    .iter()
+                    .any(|name| key.eq_ignore_ascii_case(name))
+                    .then_some(Kind::Vwap)
+            })
+            .or_else(|| {
+                ["fibonacci", "retracement", "fib-retracement"]
+                    .iter()
+                    .any(|name| key.eq_ignore_ascii_case(name))
+                    .then_some(Kind::Fib)
+            })
     }
 
     /// Whether this kind has an inside: a fill, and room for text in it.
     pub fn is_bounded(self) -> bool {
         matches!(self, Kind::Rect | Kind::Ellipse)
+    }
+
+    /// Whether it is painted under the bars rather than over them. A profile
+    /// is shading, as the study's profiles and a band's fill are, and a
+    /// shade over the candles hides what it describes; everything else is
+    /// a mark on the chart, and goes on top.
+    pub fn under_bars(self) -> bool {
+        self == Kind::Profile
+    }
+
+    /// Whether it can carry words: the text itself, and every figure. A
+    /// profile cannot, since it is read for its rows and has no inside free
+    /// of them.
+    pub fn takes_text(self) -> bool {
+        !self.reads_bars() && self != Kind::Fib
+    }
+
+    /// Whether what it draws is worked out from the bars it covers rather
+    /// than drawn through its anchors' prices: the profile and the anchored
+    /// VWAP. Neither is moved whole, since moved it would describe other
+    /// bars; its anchors are what change what it covers.
+    pub fn reads_bars(self) -> bool {
+        matches!(self, Kind::Profile | Kind::Vwap)
+    }
+
+    /// Whether it is pinned at one point rather than spanning two: words,
+    /// and the anchored VWAP, whose second anchor is its first.
+    pub fn one_anchor(self) -> bool {
+        matches!(self, Kind::Text | Kind::Vwap)
     }
 
     /// Whether the drawing is the text itself, rather than a shape that may
@@ -1039,7 +1116,394 @@ pub struct Style {
     /// actually say never is.
     #[serde(default)]
     pub text: TextStyle,
+    /// What only a volume profile has. Left out of every other kind's
+    /// stored style, which would only ever carry the defaults.
+    #[serde(default, skip_serializing_if = "ProfileLook::is_default")]
+    pub profile: ProfileLook,
+    /// What only an anchored VWAP has, left out of every other kind's the
+    /// same way.
+    #[serde(default, skip_serializing_if = "VwapLook::is_default")]
+    pub vwap: VwapLook,
+    /// What only a Fibonacci retracement has: its levels and their labels.
+    #[serde(default, skip_serializing_if = "FibLook::is_default")]
+    pub fib: FibLook,
 }
+
+/// An anchored VWAP's own properties: the study's, as one drawing carries
+/// them. The line is the drawing's colour at its width, drawn in `line`'s
+/// pattern; the price it weights and the three bands round it are here.
+///
+/// All of it is part of the style, so all of it is part of a configuration:
+/// a look saved as configuration N brings its bands back with it.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct VwapLook {
+    #[serde(default)]
+    pub source: VwapSource,
+    #[serde(default)]
+    pub line: LineStyle,
+    /// Always the study's three, innermost first, each switched on or off
+    /// rather than added or taken away, so a band keeps its look while it
+    /// is hidden.
+    #[serde(default = "vwap_bands", deserialize_with = "stored_vwap_bands")]
+    pub bands: Vec<VwapBand>,
+}
+
+impl Default for VwapLook {
+    fn default() -> VwapLook {
+        VwapLook { source: VwapSource::default(), line: LineStyle::default(), bands: vwap_bands() }
+    }
+}
+
+impl VwapLook {
+    fn is_default(&self) -> bool {
+        *self == VwapLook::default()
+    }
+
+    /// The bands that are drawn.
+    pub fn shown(&self) -> impl Iterator<Item = &VwapBand> {
+        self.bands.iter().filter(|band| band.enabled)
+    }
+}
+
+/// One band round an anchored VWAP: the study's band, in a drawing's paint.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct VwapBand {
+    /// Standard deviations from the line.
+    pub deviations: f64,
+    pub enabled: bool,
+    /// `None` is the line's own colour, and follows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub colour: Option<Paint>,
+    /// Shade the area between this band's edges.
+    pub fill: bool,
+    /// How much of the colour that shading gets.
+    pub fill_alpha: f64,
+    /// Its two edges. A width of zero draws none, which is how the inner
+    /// band is a shade with no outline.
+    pub stroke: Stroke,
+}
+
+impl VwapBand {
+    /// The colour it is drawn in, under a line of `line`.
+    pub fn paint<'a>(&'a self, line: &'a Paint) -> &'a Paint {
+        self.colour.as_ref().unwrap_or(line)
+    }
+}
+
+/// The study's three bands, as it ships them and off: the drawing's are
+/// read from the same list, so the two cannot come to disagree.
+pub fn vwap_bands() -> Vec<VwapBand> {
+    crate::indicators::vwap::default_bands()
+        .into_iter()
+        .map(|band| VwapBand {
+            deviations: band.deviations,
+            enabled: band.enabled,
+            colour: None,
+            fill: band.fill,
+            fill_alpha: band.alpha(),
+            stroke: band.stroke,
+        })
+        .collect()
+}
+
+/// The bands as stored, or the study's three when what is stored is not a
+/// list of them: the first builds of the anchored VWAP kept only the
+/// multiples that were on, and a drawing saved by one should open rather
+/// than fail.
+fn stored_vwap_bands<'de, D: serde::Deserializer<'de>>(from: D) -> Result<Vec<VwapBand>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Stored {
+        Bands(Vec<VwapBand>),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match Stored::deserialize(from)? {
+        Stored::Bands(bands) if bands.len() == VWAP_BAND_COUNT => bands,
+        _ => vwap_bands(),
+    })
+}
+
+/// How many bands an anchored VWAP has: the study's three.
+pub const VWAP_BAND_COUNT: usize = 3;
+
+/// How near and how far a band may be set, in standard deviations: the
+/// study's dialog's ends, in tenths.
+pub const MIN_VWAP_DEVIATIONS: f64 = 0.1;
+pub const MAX_VWAP_DEVIATIONS: f64 = 6.0;
+
+pub use crate::indicators::{LineStyle, Stroke};
+pub use crate::indicators::vwap::Source as VwapSource;
+
+/// The ratios a Fibonacci retracement draws a level at, from the end of the
+/// swing back to its start: the seven every charting tool ships with.
+pub const FIB_RATIOS: [f64; 7] = [0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0];
+
+/// How much of its colour a retracement's level gets. Seven lines across a
+/// swing at full strength are a cage over the candles; at this one they are
+/// read as levels, the candles stay in front, and a theme's text colour
+/// becomes the soft grey the default is meant to be rather than white or
+/// black. The edge of a box is drawn at a strength of its own for the same
+/// reason.
+pub const FIB_ALPHA: f64 = 0.7;
+
+/// And the line from the swing's start to its end, which says which way
+/// it was drawn and carries its grips: a guide, quieter than any level.
+pub const FIB_TREND_ALPHA: f64 = 0.4;
+
+/// The size a level's label is set at, in pixels: the chart's axis labels'
+/// own, since a ratio and a price are read the way the axis is.
+pub const FIB_LABEL_SIZE: f64 = 11.0;
+
+/// The thickness a level is drawn at when nobody chose one: a hairline.
+pub const FIB_WIDTH: f64 = 1.0;
+
+/// A Fibonacci retracement's own properties: its seven levels and what
+/// their labels say.
+///
+/// All of it is part of the style, so all of it is part of a configuration:
+/// a look saved as configuration N brings every level's colour, thickness
+/// and pattern back with it.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(from = "StoredFibLook")]
+pub struct FibLook {
+    /// Always the seven of [`FIB_RATIOS`], in that order, each switched on
+    /// or off rather than added or taken away, so a level keeps its look
+    /// while it is hidden.
+    pub levels: Vec<FibLevel>,
+    /// Whether each level is labelled with its ratio, 0.618.
+    pub fib_labels: bool,
+    /// Whether each level is labelled with its price. Off unless asked for:
+    /// the price axis already reads a level's price, and seven of them
+    /// crowd a short swing.
+    pub price_labels: bool,
+}
+
+impl Default for FibLook {
+    fn default() -> FibLook {
+        FibLook { levels: fib_levels(), fib_labels: true, price_labels: false }
+    }
+}
+
+/// A retracement's look as stored, read the way it was written before the
+/// labels were two: one `labels` switch said both, ratio and price, so it
+/// sets both when the two are not there.
+#[derive(Deserialize)]
+struct StoredFibLook {
+    #[serde(default = "fib_levels", deserialize_with = "stored_fib_levels")]
+    levels: Vec<FibLevel>,
+    #[serde(default)]
+    fib_labels: Option<bool>,
+    #[serde(default)]
+    price_labels: Option<bool>,
+    #[serde(default)]
+    labels: Option<bool>,
+}
+
+impl From<StoredFibLook> for FibLook {
+    fn from(stored: StoredFibLook) -> FibLook {
+        let shipped = FibLook::default();
+        FibLook {
+            levels: stored.levels,
+            fib_labels: stored.fib_labels.or(stored.labels).unwrap_or(shipped.fib_labels),
+            price_labels: stored.price_labels.or(stored.labels).unwrap_or(shipped.price_labels),
+        }
+    }
+}
+
+impl FibLook {
+    /// Whether any label is drawn.
+    pub fn labelled(&self) -> bool {
+        self.fib_labels || self.price_labels
+    }
+
+    fn is_default(&self) -> bool {
+        *self == FibLook::default()
+    }
+
+    /// The levels that are drawn.
+    pub fn enabled(&self) -> impl Iterator<Item = &FibLevel> {
+        self.levels.iter().filter(|level| level.enabled)
+    }
+
+    /// The thickness every level shares, or `None` when they differ.
+    pub fn width(&self) -> Option<f64> {
+        let first = self.levels.first()?.stroke.width;
+        self.levels.iter().all(|level| level.stroke.width == first).then_some(first)
+    }
+
+    /// Every level at one thickness: what a thickness picked for the whole
+    /// drawing means.
+    pub fn set_width(&mut self, width: f64) {
+        for level in self.levels.iter_mut() {
+            level.stroke.width = width;
+        }
+    }
+
+    /// The level at a ratio, to change it.
+    pub fn level_mut(&mut self, ratio: f64) -> Option<&mut FibLevel> {
+        self.levels.iter_mut().find(|level| same_ratio(level.ratio, ratio))
+    }
+}
+
+/// One level of a retracement.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct FibLevel {
+    pub ratio: f64,
+    pub enabled: bool,
+    /// `None` is the drawing's own colour, and follows it: one colour for
+    /// every level is the default, and changing it changes them all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub colour: Option<Paint>,
+    pub stroke: Stroke,
+}
+
+impl FibLevel {
+    pub fn new(ratio: f64) -> FibLevel {
+        FibLevel { ratio, enabled: true, colour: None, stroke: Stroke::new(FIB_WIDTH, LineStyle::Solid) }
+    }
+
+    /// The colour it is drawn in, on a drawing of `colour`.
+    pub fn paint<'a>(&'a self, colour: &'a Paint) -> &'a Paint {
+        self.colour.as_ref().unwrap_or(colour)
+    }
+
+    /// Its price on a swing from `start` to `end`: the end at 0 and the
+    /// start at 1, whichever way the swing went.
+    pub fn price(&self, start: f64, end: f64) -> f64 {
+        end + (start - end) * self.ratio
+    }
+
+    /// The ratio as it is written on the chart and typed on a command line:
+    /// `0`, `0.236`, `0.5`, `1`.
+    pub fn name(&self) -> String {
+        fib_ratio_name(self.ratio)
+    }
+}
+
+/// A ratio as a level is labelled: a percentage, with its decimal only
+/// where it has one, so 61.8% and 50% rather than 0.618 and 50.0%.
+pub fn fib_ratio_name(ratio: f64) -> String {
+    let text = format!("{:.1}", ratio * 100.0);
+    let text = text.strip_suffix(".0").unwrap_or(&text);
+    match text {
+        "-0" => "0%".to_string(),
+        other => format!("{other}%"),
+    }
+}
+
+/// Two ratios are the same level when they agree to the third place, which
+/// is as far as any of the seven is written.
+pub fn same_ratio(a: f64, b: f64) -> bool {
+    (a - b).abs() < 0.0005
+}
+
+/// The seven levels, every one on, solid, a hairline, in the drawing's
+/// colour.
+pub fn fib_levels() -> Vec<FibLevel> {
+    FIB_RATIOS.into_iter().map(FibLevel::new).collect()
+}
+
+/// The levels as stored, or the seven as shipped when what is stored is not
+/// the seven: a store written by some later build with other ratios should
+/// open rather than fail.
+fn stored_fib_levels<'de, D: serde::Deserializer<'de>>(from: D) -> Result<Vec<FibLevel>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Stored {
+        Levels(Vec<FibLevel>),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match Stored::deserialize(from)? {
+        Stored::Levels(levels)
+            if levels.len() == FIB_RATIOS.len()
+                && levels.iter().zip(FIB_RATIOS).all(|(level, ratio)| same_ratio(level.ratio, ratio)) =>
+        {
+            levels
+        }
+        _ => fib_levels(),
+    })
+}
+
+/// A volume profile drawing's own properties: the study's, as one drawing
+/// carries them. The rows are the drawing's fill, the value area at its
+/// alpha and the rest at [`PROFILE_ROW_SHARE`] of it; the edge round them is
+/// its colour.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct ProfileLook {
+    /// The line across the busiest price.
+    pub poc: Paint,
+    /// Solid rows, or only their outline.
+    #[serde(default)]
+    pub shape: ProfileShape,
+    /// The edge of the span the rows grow from.
+    #[serde(default)]
+    pub align: ProfileAlign,
+    /// Fraction of the volume the value area covers.
+    pub value_area: f64,
+    /// Rows to divide the span into, or `None` for the instrument's own
+    /// increment, as the study does.
+    #[serde(default)]
+    pub rows: Option<usize>,
+    /// How much of the outline and the background shows, over the strength
+    /// each is drawn at: 1 is the look as designed, 0 nothing. The point of
+    /// control keeps its own, being the line the profile is read by.
+    #[serde(default = "ProfileLook::opaque")]
+    pub opacity: f64,
+    /// The point of control's thickness. The outline's is the drawing's
+    /// own `width`.
+    #[serde(default = "ProfileLook::poc_default")]
+    pub poc_width: f64,
+}
+
+impl ProfileLook {
+    fn opaque() -> f64 {
+        1.0
+    }
+
+    fn poc_default() -> f64 {
+        DEFAULT_WIDTH
+    }
+
+    fn is_default(&self) -> bool {
+        *self == ProfileLook::default()
+    }
+}
+
+impl Default for ProfileLook {
+    fn default() -> ProfileLook {
+        ProfileLook {
+            poc: Paint::preset(Preset::Ink),
+            shape: ProfileShape::Filled,
+            align: ProfileAlign::Left,
+            value_area: 0.70,
+            rows: None,
+            opacity: 1.0,
+            poc_width: DEFAULT_WIDTH,
+        }
+    }
+}
+
+pub use crate::indicators::profile::{Align as ProfileAlign, Style as ProfileShape};
+
+/// The value area's fill: the study's own. A drawing over a study is already
+/// on top, and being louder would only cost the candles under it — at 0.36
+/// the up and down bodies under a fill fall below 0.06 ΔE apart.
+pub const PROFILE_ALPHA: f64 = 0.30;
+
+/// The rows outside the value area, as a share of its alpha: the study's
+/// 0.14 to its 0.30.
+pub const PROFILE_ROW_SHARE: f64 = 0.14 / 0.30;
+
+/// The hairline around a filled profile's silhouette, the drawing's and the
+/// study's alike. Soft on purpose: 0.55 read as a box drawn round the rows
+/// on a light theme, and 0.45 is the lowest that is still a rim on every
+/// shipped theme, 1.59:1 on the chart and 0.05 ΔE off its own fill at worst,
+/// and stays one at 20% transparency.
+pub const PROFILE_EDGE_ALPHA: f64 = 0.45;
+
+/// The point of control's strength, the study's. Its width is its own,
+/// [`ProfileLook::poc_width`], a stroke where the study's is a hairline.
+pub const PROFILE_POC_ALPHA: f64 = 0.9;
 
 /// How a drawing's text is set: its colour, its face and its size.
 ///
@@ -1111,6 +1575,9 @@ impl Style {
             fill: Paint::preset(preset),
             alpha: FILL_ALPHA,
             text: TextStyle::of(preset),
+            profile: ProfileLook::default(),
+            vwap: VwapLook::default(),
+            fib: FibLook::default(),
         }
     }
 
@@ -1127,6 +1594,9 @@ impl Style {
             fill: Paint::preset(preset),
             alpha: FILL_ALPHA,
             text: TextStyle::of(preset),
+            profile: ProfileLook::default(),
+            vwap: VwapLook::default(),
+            fib: FibLook::default(),
         }
     }
 
@@ -1170,6 +1640,128 @@ impl Style {
         Style { border: false, alpha: 0.0, ..Style::rect(preset) }
     }
 
+    /// A volume profile starts from the box's look, with what only a
+    /// profile has: filled rows growing from the left, under a point of
+    /// control in Ink.
+    pub fn profile(preset: Preset) -> Style {
+        Style::profile_shaped(preset, ProfileShape::Filled, ProfileAlign::Left)
+    }
+
+    /// The same profile as its outline alone.
+    pub fn profile_outline(preset: Preset) -> Style {
+        Style::profile_shaped(preset, ProfileShape::Outline, ProfileAlign::Left)
+    }
+
+    /// Volume profile configuration `n`, 1 to 9, as shipped.
+    ///
+    /// Not the nine presets in order, as every other kind is. A profile
+    /// says nothing about direction, and Up and Down filled in green and red
+    /// read as buying and selling, so the nine leave the candles' colours
+    /// out, and Teal and Orange with them, which sit next to green and red
+    /// on enough themes to be taken for them. What is left is four colours,
+    /// filled from 1 to 4 and as outlines in the same order from 5 to 8,
+    /// all growing from the left as the study does. Cool and warm take
+    /// turns, so neighbours stand apart, and Blue, the colour a chart's
+    /// first indicators take, comes last. The ninth is Ink, the theme's text
+    /// as a grey, as an
+    /// outline growing from the right: the one neutral, and the one on the
+    /// other side.
+    pub fn profile_configuration(n: u8) -> Style {
+        match n.clamp(1, CONFIGURATIONS) {
+            n @ 1..=4 => Style::profile(PROFILE_COLOURS[n as usize - 1]),
+            n @ 5..=8 => Style::profile_outline(PROFILE_COLOURS[n as usize - 5]),
+            _ => Style::profile_shaped(Preset::Ink, ProfileShape::Outline, ProfileAlign::Right),
+        }
+    }
+
+    fn profile_shaped(preset: Preset, shape: ProfileShape, align: ProfileAlign) -> Style {
+        // A filled profile's outline is a hairline round its rows; an
+        // outline is the whole of the drawing, at a line's weight.
+        let width = match shape {
+            ProfileShape::Filled => BORDER_WIDTH,
+            ProfileShape::Outline => DEFAULT_WIDTH,
+        };
+        Style {
+            width,
+            alpha: PROFILE_ALPHA,
+            // Filled rows go without an edge until one is asked for; the
+            // outline style is nothing but one.
+            border: false,
+            profile: ProfileLook { shape, align, ..ProfileLook::default() },
+            ..Style::rect(preset)
+        }
+    }
+
+    /// Volume profile configuration `n` as it shipped before the nine were
+    /// taken off the candles' colours: the nine presets in order, set apart
+    /// by form and side. Kept only to recognise a stored configuration
+    /// nobody changed, so it can be read as today's.
+    fn profile_as_first_shipped(n: u8) -> Style {
+        let preset = Preset::ALL[(n.clamp(1, CONFIGURATIONS) - 1) as usize];
+        let (shape, align) = match preset {
+            Preset::Up | Preset::Down | Preset::Ink => (ProfileShape::Filled, ProfileAlign::Left),
+            Preset::Blue | Preset::Cyan => (ProfileShape::Outline, ProfileAlign::Left),
+            Preset::Amber | Preset::Violet | Preset::Orange => (ProfileShape::Filled, ProfileAlign::Right),
+            Preset::Teal => (ProfileShape::Outline, ProfileAlign::Right),
+        };
+        Style::profile_shaped(preset, shape, align)
+    }
+
+    /// An anchored VWAP is a line, and starts as one: the preset's colour
+    /// at the chart's stroke, with no bands.
+    pub fn vwap(preset: Preset) -> Style {
+        Style::line(preset)
+    }
+
+    /// A Fibonacci retracement in one colour: every level in the preset's
+    /// colour, a solid hairline, labelled.
+    pub fn fib(preset: Preset) -> Style {
+        Style { width: FIB_WIDTH, ..Style::line(preset) }
+    }
+
+    /// The nine retracement configurations.
+    ///
+    /// One colour each and no fills, so a retracement is a set of levels
+    /// rather than a rainbow. Not the nine presets in order, as the other
+    /// kinds are: those start with Up and Down, and a retracement is not up
+    /// or down, it is a ruler laid over a move either way. So the first is
+    /// Ink — the chart's own text colour with the tint taken out, drawn at
+    /// [`FIB_ALPHA`], a soft grey on a dark theme and on a light one — with
+    /// the levels told apart by pattern: the swing's ends solid, the half
+    /// dashed, the rest dotted, so the eye finds the frame and the middle
+    /// before the ratios between. The second is the same Ink with every
+    /// level solid. Three to eight
+    /// are the colour presets in the places every other kind has them, so
+    /// configuration four is amber here as it is everywhere. The ninth is
+    /// Ink at the five levels most people read, without 0.236 and 0.786.
+    pub fn fib_configurations() -> Vec<Style> {
+        let graded = {
+            let mut style = Style::fib(Preset::Ink);
+            for level in style.fib.levels.iter_mut() {
+                level.stroke.style = match level.ratio {
+                    r if same_ratio(r, 0.0) || same_ratio(r, 1.0) => LineStyle::Solid,
+                    r if same_ratio(r, 0.5) => LineStyle::Dashed,
+                    _ => LineStyle::Dotted,
+                };
+            }
+            style
+        };
+        let sparse = {
+            let mut style = Style::fib(Preset::Ink);
+            for level in style.fib.levels.iter_mut() {
+                level.enabled = !(same_ratio(level.ratio, 0.236) || same_ratio(level.ratio, 0.786));
+            }
+            style
+        };
+        let mut nine = vec![graded, Style::fib(Preset::Ink)];
+        nine.extend(
+            [Preset::Blue, Preset::Amber, Preset::Violet, Preset::Teal, Preset::Orange, Preset::Cyan]
+                .map(Style::fib),
+        );
+        nine.push(sparse);
+        nine
+    }
+
     /// The configuration this kind starts from.
     pub fn of(kind: Kind, preset: Preset) -> Style {
         match kind {
@@ -1184,6 +1776,9 @@ impl Style {
             // a green stop would be a lie. The style only carries the words
             // and how much of the fill shows.
             Kind::Position => Style { border: false, ..Style::rect(preset) },
+            Kind::Profile => Style::profile(preset),
+            Kind::Vwap => Style::vwap(preset),
+            Kind::Fib => Style::fib(preset),
         }
     }
 
@@ -1206,7 +1801,8 @@ impl Style {
 /// configuration N looks like N as it is now — change N and they all change,
 /// which is the point of a configuration over a copy. The defaults are the
 /// nine presets in order, so configuration 1 is Up and 2 is Down, as the
-/// brief asks.
+/// brief asks, for every kind but the volume profile, whose nine are its own
+/// ([`Style::profile_configuration`]).
 ///
 /// One list per kind, and every list is nine long. A kind added later reads
 /// back as absent from anything already written down, which [`list`] treats
@@ -1230,10 +1826,35 @@ pub struct Configurations {
     pub zigzag: Vec<Style>,
     #[serde(default)]
     pub position: Vec<Style>,
+    #[serde(default, deserialize_with = "renewed_profiles")]
+    pub profile: Vec<Style>,
+    #[serde(default)]
+    pub vwap: Vec<Style>,
+    #[serde(default)]
+    pub fib: Vec<Style>,
 }
 
 /// How many configurations each kind has.
 pub const CONFIGURATIONS: u8 = 9;
+
+/// The volume profile's four colours, in the order configurations 1 to 4
+/// fill them and 5 to 8 outline them.
+pub const PROFILE_COLOURS: [Preset; 4] = [Preset::Violet, Preset::Amber, Preset::Cyan, Preset::Blue];
+
+/// Stored volume profile configurations, with every one still as it first
+/// shipped read as it ships now. One somebody changed is theirs and is kept
+/// exactly; one nobody touched was only ever the default, and the default
+/// moved.
+fn renewed_profiles<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<Style>, D::Error> {
+    let mut stored = Vec::<Style>::deserialize(deserializer)?;
+    for (at, style) in stored.iter_mut().enumerate().take(CONFIGURATIONS as usize) {
+        let n = at as u8 + 1;
+        if *style == Style::profile_as_first_shipped(n) {
+            *style = Style::profile_configuration(n);
+        }
+    }
+    Ok(stored)
+}
 
 impl Default for Configurations {
     fn default() -> Configurations {
@@ -1247,6 +1868,9 @@ impl Default for Configurations {
             ellipse: nine(Style::ellipse),
             text: nine(Style::text),
             position: nine(|preset| Style::of(Kind::Position, preset)),
+            profile: (1..=CONFIGURATIONS).map(Style::profile_configuration).collect(),
+            vwap: nine(Style::vwap),
+            fib: Style::fib_configurations(),
         }
     }
 }
@@ -1308,6 +1932,9 @@ impl Configurations {
             Kind::Ellipse => &self.ellipse,
             Kind::Text => &self.text,
             Kind::Position => &self.position,
+            Kind::Profile => &self.profile,
+            Kind::Vwap => &self.vwap,
+            Kind::Fib => &self.fib,
         }
     }
 
@@ -1321,6 +1948,9 @@ impl Configurations {
             Kind::Ellipse => &mut self.ellipse,
             Kind::Text => &mut self.text,
             Kind::Position => &mut self.position,
+            Kind::Profile => &mut self.profile,
+            Kind::Vwap => &mut self.vwap,
+            Kind::Fib => &mut self.fib,
         }
     }
 
@@ -1664,6 +2294,20 @@ impl Drawing {
     /// rightward at all, since both its side grips sit on one spot and the
     /// left one is found first.
     pub fn drag_grip(&mut self, grip: Grip, at: Anchor) -> Grip {
+        // A profile's corners are its two edges: dragged past the other one,
+        // the hand holds the matching corner on the far side.
+        if self.kind == Kind::Profile {
+            let Some(side) = profile_side(grip) else { return grip };
+            let held = self.drag_grip_edge(side, at);
+            return match held == side {
+                true => grip,
+                false => mirrored(grip),
+            };
+        }
+        self.drag_grip_edge(grip, at)
+    }
+
+    fn drag_grip_edge(&mut self, grip: Grip, at: Anchor) -> Grip {
         self.move_grip(grip, at);
         // A position's grips are each one price or one moment, named for
         // what they are rather than where they sit, so none turns into
@@ -1688,7 +2332,8 @@ impl Drawing {
         // moved both go: nothing reads the second, and letting them drift
         // apart would leave a drawing whose box depends on which grip was
         // last dragged.
-        if self.kind.is_text() {
+        // An anchored VWAP is the same: one anchor, and its grip moves it.
+        if self.kind.one_anchor() {
             self.from = at;
             self.to = at;
             return;
@@ -1706,6 +2351,14 @@ impl Drawing {
             self.to.price = at.price;
             return;
         }
+        // Whichever corner of a profile, its edge on that side.
+        let grip = match self.kind {
+            Kind::Profile => match profile_side(grip) {
+                Some(side) => side,
+                None => return,
+            },
+            _ => grip,
+        };
         if let Grip::Corner(n) = grip {
             if let Some(corner) = self.points.get_mut(n) {
                 *corner = at;
@@ -1771,7 +2424,12 @@ impl Drawing {
     }
 
     /// Shift the whole drawing by a span of time and a difference in price.
+    /// A volume profile stays where it is: moved, it would be a profile of
+    /// other bars, which is a change of span its edges are for.
     pub fn shift(&mut self, by_ts: i64, by_price: f64) {
+        if self.kind.reads_bars() {
+            return;
+        }
         for anchor in [&mut self.from, &mut self.to] {
             anchor.ts += by_ts;
             anchor.price += by_price;
@@ -1820,9 +2478,39 @@ impl Drawing {
             // The entry, the target and the stop, all at the start, and the
             // far end on the entry line to draw it out in time.
             Kind::Position => &[Grip::From, Grip::FromTo, Grip::Stop, Grip::Right],
+            // A grip at each corner, where a hand looks for one, but all
+            // four move only the edge they are on: the span is all a profile
+            // has to change. Nothing moves its prices; those are the bars'.
+            Kind::Profile => &[Grip::From, Grip::FromTo, Grip::ToFrom, Grip::To],
+            // The anchor, on the bar the line starts from: dragged to
+            // another bar, the VWAP starts from that one.
+            Kind::Vwap => &[Grip::From],
+            // The swing's two ends, which are its two anchors.
+            Kind::Fib => &[Grip::From, Grip::To],
             // Answered above, where the number of them is known.
             Kind::Zigzag => &[],
         }
+    }
+}
+
+/// The edge of a profile a corner grip moves: the left two its start, the
+/// right two its end.
+fn profile_side(grip: Grip) -> Option<Grip> {
+    match grip {
+        Grip::From | Grip::FromTo | Grip::Left => Some(Grip::Left),
+        Grip::To | Grip::ToFrom | Grip::Right => Some(Grip::Right),
+        _ => None,
+    }
+}
+
+/// The corner across from it on the other edge, at the same height.
+fn mirrored(grip: Grip) -> Grip {
+    match grip {
+        Grip::From => Grip::ToFrom,
+        Grip::ToFrom => Grip::From,
+        Grip::FromTo => Grip::To,
+        Grip::To => Grip::FromTo,
+        grip => grip,
     }
 }
 
@@ -1885,16 +2573,33 @@ pub struct Projected {
     /// A position's stop, as a height in pixels. `None` for every other
     /// kind.
     pub stop: Option<f64>,
+    /// A retracement's levels that are drawn, as heights on screen, and
+    /// empty for every other kind. Worked out by the chart, which is the
+    /// only one that knows whether its price scale is linear: on a log
+    /// scale the levels are not evenly spaced between the anchors.
+    pub levels: Vec<f64>,
 }
 
 impl Projected {
     pub fn new(kind: Kind, from: (f64, f64), to: (f64, f64)) -> Projected {
-        Projected { kind, from, to, corners: Vec::new(), words: None, stop: None }
+        Projected { kind, from, to, corners: Vec::new(), words: None, stop: None, levels: Vec::new() }
     }
 
     /// The same projection, told where a position's stop is on screen.
     pub fn with_stop(self, y: f64) -> Projected {
         Projected { stop: Some(y), ..self }
+    }
+
+    /// A retracement's projection: its two ends, and its levels' heights.
+    pub fn with_levels(self, levels: Vec<f64>) -> Projected {
+        Projected { levels, ..self }
+    }
+
+    /// A retracement's levels as segments across the span its ends mark
+    /// out.
+    pub fn level_segments(&self) -> Vec<((f64, f64), (f64, f64))> {
+        let (left, right) = ordered(self.from.0, self.to.0);
+        self.levels.iter().map(|y| ((left, *y), (right, *y))).collect()
     }
 
     /// A projection through a run of corners: the first and the last are
@@ -1903,7 +2608,7 @@ impl Projected {
     pub fn through(kind: Kind, corners: Vec<(f64, f64)>) -> Projected {
         let from = corners.first().copied().unwrap_or((0.0, 0.0));
         let to = corners.last().copied().unwrap_or(from);
-        Projected { kind, from, to, corners, words: None, stop: None }
+        Projected { kind, from, to, corners, words: None, stop: None, levels: Vec::new() }
     }
 
     /// The same projection, told where its words landed.
@@ -1922,7 +2627,10 @@ impl Projected {
     /// Where a grip is on screen.
     pub fn grip(&self, grip: Grip) -> Option<(f64, f64)> {
         if let Grip::Corner(n) = grip {
-            return self.corners.get(n).copied();
+            return match self.kind {
+                Kind::Vwap => None,
+                _ => self.corners.get(n).copied(),
+            };
         }
         if self.kind.is_position() {
             return match grip {
@@ -1935,6 +2643,22 @@ impl Projected {
         }
         match (self.kind, grip) {
             (Kind::Text, _) => None,
+            // The corners of the box it fills, the left two on its start and
+            // the right two on its end, wherever its anchors are.
+            (Kind::Profile, Grip::From | Grip::FromTo | Grip::ToFrom | Grip::To) => {
+                let (left, top, w, h) = self.bounds();
+                Some(match grip {
+                    Grip::From => (left, top),
+                    Grip::FromTo => (left, top + h),
+                    Grip::ToFrom => (left + w, top),
+                    _ => (left + w, top + h),
+                })
+            }
+            (Kind::Profile, _) => None,
+            // Its anchor, where the line starts. The rest of the line is
+            // its corners, and none of them is a grip.
+            (Kind::Vwap, Grip::From) => Some(self.from),
+            (Kind::Vwap, _) => None,
             (_, Grip::From) => Some(self.from),
             (_, Grip::To) => Some(self.to),
             (Kind::Rect | Kind::Ellipse, Grip::FromTo) => Some((self.from.0, self.to.1)),
@@ -1964,6 +2688,9 @@ impl Projected {
         // is drawn.
         let fixed: &[Grip] = match self.corners.is_empty() {
             true if self.kind.is_position() => &[Grip::From, Grip::FromTo, Grip::Stop, Grip::Right],
+            // The line a VWAP is drawn as is points worked out from the
+            // bars, not corners anybody put there; its anchor is its grip.
+            _ if self.kind == Kind::Vwap => &[Grip::From],
             true => &[
                 Grip::From,
                 Grip::To,
@@ -2013,11 +2740,21 @@ impl Projected {
             // Every kind that is a stroke is picked the same way: near the
             // segment. What differs between them is what is drawn on it, not
             // where it is.
-            Kind::Line | Kind::Horizontal | Kind::Arrow | Kind::Zigzag => self
+            Kind::Line | Kind::Horizontal | Kind::Arrow | Kind::Zigzag | Kind::Vwap => self
                 .segments()
                 .iter()
                 .any(|(a, b)| distance_to_segment((x, y), *a, *b) <= reach),
-            Kind::Rect => {
+            // Any of its levels, or the line from the swing's start to its
+            // end: what is drawn, and not the empty space between levels,
+            // which belongs to the candles there.
+            Kind::Fib => self
+                .level_segments()
+                .iter()
+                .chain(std::iter::once(&(self.from, self.to)))
+                .any(|(a, b)| distance_to_segment((x, y), *a, *b) <= reach),
+            // Its span and the prices it reached, which the chart puts in
+            // its anchors when it projects it.
+            Kind::Rect | Kind::Profile => {
                 let (left, right) = ordered(self.from.0, self.to.0);
                 let (top, bottom) = ordered(self.from.1, self.to.1);
                 (left - reach..=right + reach).contains(&x) && (top - reach..=bottom + reach).contains(&y)
@@ -2053,14 +2790,19 @@ impl Projected {
             return true;
         }
         match self.kind {
-            Kind::Line | Kind::Horizontal | Kind::Arrow | Kind::Zigzag => self
+            Kind::Line | Kind::Horizontal | Kind::Arrow | Kind::Zigzag | Kind::Vwap => self
                 .segments()
                 .iter()
+                .any(|(a, b)| segment_meets_box(*a, *b, left, top, right, bottom)),
+            Kind::Fib => self
+                .level_segments()
+                .iter()
+                .chain(std::iter::once(&(self.from, self.to)))
                 .any(|(a, b)| segment_meets_box(*a, *b, left, top, right, bottom)),
             // The box the shape fills. A dragged selection is a rough
             // gesture over a region, not a click: catching an ellipse whose
             // bounding box the hand swept is what the hand meant.
-            Kind::Rect | Kind::Ellipse | Kind::Position => overlaps(self.bounds()),
+            Kind::Rect | Kind::Ellipse | Kind::Position | Kind::Profile => overlaps(self.bounds()),
             Kind::Text => false,
         }
     }
@@ -2975,13 +3717,18 @@ mod configuration_tests {
     }
 
     /// Nine of every kind, named by the preset of that number, so Alt+4 is
-    /// amber whichever tool is in hand.
+    /// amber whichever tool is in hand. A volume profile has nine of its
+    /// own, and a retracement keeps three to eight with neutrals where the
+    /// others have Up and Down; their own tests say why.
     #[test]
     fn the_nine_are_the_nine_presets_for_every_kind() {
         let configs = Configurations::default();
         for kind in Kind::ALL {
             assert_eq!(configs.list(kind).len(), CONFIGURATIONS as usize);
             for (at, preset) in Preset::ALL.into_iter().enumerate() {
+                if kind == Kind::Profile || (kind == Kind::Fib && !(3..=8).contains(&(at + 1))) {
+                    continue;
+                }
                 assert_eq!(configs.of(kind, at as u8 + 1), &Style::of(kind, preset));
             }
         }
@@ -3363,5 +4110,334 @@ mod edge_grip_tests {
         let mut prices = [drawing.from.price, drawing.to.price];
         prices.sort_by(f64::total_cmp);
         assert_eq!(prices, [50.0, 80.0]);
+    }
+
+    #[test]
+    fn a_profile_is_resized_by_its_edges_and_never_moved_whole() {
+        let mut drawing = Drawing::new(Kind::Profile, Anchor::new(100, 10.0), Anchor::new(200, 10.0));
+        assert_eq!(drawing.grips(), vec![Grip::From, Grip::FromTo, Grip::ToFrom, Grip::To]);
+        // A top corner moves only the time of its edge.
+        drawing.move_grip(Grip::From, Anchor::new(50, 99.0));
+        assert_eq!((drawing.from.ts, drawing.from.price), (50, 10.0));
+        drawing.move_grip(Grip::From, Anchor::new(100, 99.0));
+        drawing.shift(50, 1.0);
+        assert_eq!((drawing.from.ts, drawing.to.ts), (100, 200), "not moved whole");
+        drawing.move_grip(Grip::Right, Anchor::new(300, 0.0));
+        assert_eq!((drawing.from.ts, drawing.to.ts), (100, 300));
+        assert!(!Kind::Profile.takes_text());
+        assert_eq!(Kind::from_key("vp"), Some(Kind::Profile));
+    }
+
+    #[test]
+    fn an_anchored_vwap_is_one_anchor_moved_by_its_grip_alone() {
+        let mut drawing = Drawing::new(Kind::Vwap, Anchor::new(100, 10.0), Anchor::new(100, 10.0));
+        assert_eq!(drawing.grips(), vec![Grip::From]);
+        // Its grip takes both anchors to the bar it is dropped on.
+        drawing.drag_grip(Grip::From, Anchor::new(300, 42.0));
+        assert_eq!((drawing.from.ts, drawing.to.ts), (300, 300));
+        // Moved whole it would be a VWAP from another bar, so it is not.
+        drawing.shift(50, 1.0);
+        assert_eq!((drawing.from.ts, drawing.from.price), (300, 42.0), "not moved whole");
+        assert!(!Kind::Vwap.takes_text());
+        assert!(Kind::Vwap.one_anchor() && Kind::Vwap.reads_bars());
+        for key in ["avwap", "vwap", "anchored-vwap", "AVWAP"] {
+            assert_eq!(Kind::from_key(key), Some(Kind::Vwap), "{key}");
+        }
+        // Offered straight after the profile: its button is the one under it.
+        let at = Kind::ALL.iter().position(|k| *k == Kind::Vwap).unwrap();
+        assert_eq!(Kind::ALL[at - 1], Kind::Profile);
+    }
+
+    /// The line it is drawn as is points worked out from the bars, and none
+    /// of them is a grip: only the anchor is, and the line is its body.
+    #[test]
+    fn an_anchored_vwap_is_held_by_its_anchor_and_picked_on_its_line() {
+        let line = vec![(10.0, 50.0), (20.0, 40.0), (30.0, 45.0)];
+        let projected = Projected { from: (10.0, 50.0), ..Projected::through(Kind::Vwap, line) };
+        assert_eq!(projected.hit(10.0, 50.0), Some(Grip::From));
+        assert_eq!(projected.hit(30.0, 45.0), Some(Grip::Body), "the last point is no grip");
+        assert_eq!(projected.grip(Grip::Corner(1)), None);
+        assert_eq!(projected.hit(25.0, 42.5), Some(Grip::Body));
+        assert_eq!(projected.hit(25.0, 80.0), None);
+        assert!(projected.touches((18.0, 35.0, 4.0, 10.0)));
+    }
+
+    /// Its properties are the study's, with the study's defaults: a solid
+    /// line, and three bands at 1, 1.5 and 2 deviations, all off, the first
+    /// shaded with no outline, the second dashed, the third plain.
+    #[test]
+    fn an_anchored_vwap_starts_with_the_studys_properties() {
+        let configs = Configurations::default();
+        assert!((1..=9).all(|n| configs.of(Kind::Vwap, n).vwap == VwapLook::default()));
+        assert_eq!(configs.of(Kind::Vwap, 1).colour, Paint::preset(Preset::Up));
+        assert_eq!(configs.of(Kind::Vwap, 1).width, 1.5, "the study's thickness");
+        let look = VwapLook::default();
+        assert_eq!(look.line, LineStyle::Solid);
+        assert_eq!(look.shown().count(), 0, "no band drawn until asked");
+        let study = crate::indicators::vwap::default_bands();
+        assert_eq!(look.bands.len(), study.len());
+        for (band, theirs) in look.bands.iter().zip(&study) {
+            assert_eq!(band.deviations, theirs.deviations);
+            assert_eq!((band.fill, band.stroke), (theirs.fill, theirs.stroke));
+            assert_eq!(band.fill_alpha, theirs.alpha());
+            assert_eq!(band.colour, None, "the line's colour");
+        }
+        assert_eq!(look.bands[1].paint(&Paint::preset(Preset::Amber)), &Paint::preset(Preset::Amber));
+    }
+
+    /// Every property it has is in its style, so a configuration saved from
+    /// one brings all of it back, bands and their looks included, through
+    /// the store.
+    #[test]
+    fn a_configuration_saved_with_bands_brings_them_back() {
+        let mut style = Style::vwap(Preset::Amber);
+        style.width = 2.5;
+        style.vwap.source = VwapSource::Close;
+        style.vwap.line = LineStyle::Dotted;
+        style.vwap.bands[0].enabled = true;
+        style.vwap.bands[2] = VwapBand {
+            deviations: 2.5,
+            enabled: true,
+            colour: Some(Paint::preset(Preset::Violet)),
+            fill: true,
+            fill_alpha: 0.3,
+            stroke: Stroke::new(2.5, LineStyle::Dashed),
+        };
+        let mut configs = Configurations::default();
+        configs.set(Kind::Vwap, 7, style.clone());
+        let stored = serde_json::to_string(&configs).unwrap();
+        let read: Configurations = serde_json::from_str(&stored).unwrap();
+        assert_eq!(read.of(Kind::Vwap, 7), &style);
+        assert!(!read.is_default(Kind::Vwap, 7));
+
+        // A drawing following it wears all of it.
+        let mut drawing = Drawing::new(Kind::Vwap, Anchor::new(100, 0.0), Anchor::new(100, 0.0));
+        drawing.follow(7);
+        assert_eq!(drawing.style(&read), &style);
+
+        // A line's stored style says nothing about a VWAP.
+        let plain = serde_json::to_value(Style::line(Preset::Up)).unwrap();
+        assert!(plain.get("vwap").is_none(), "{plain}");
+    }
+
+    /// The first builds kept only the multiples of the bands that were on.
+    /// A style saved by one opens, with the study's bands.
+    #[test]
+    fn an_anchored_vwap_saved_with_band_multiples_opens_with_the_studys_bands() {
+        let mut stored = serde_json::to_value(Style::vwap(Preset::Teal)).unwrap();
+        stored["vwap"] = serde_json::json!({ "source": "close", "bands": [1.0, 2.0] });
+        let style: Style = serde_json::from_value(stored).unwrap();
+        assert_eq!(style.vwap.source, VwapSource::Close);
+        assert_eq!(style.vwap.bands, vwap_bands());
+    }
+
+    /// A store written before the anchored VWAP existed has no list for it,
+    /// and opens with its nine as shipped.
+    #[test]
+    fn configurations_written_before_the_anchored_vwap_read_its_defaults() {
+        let mut stored = serde_json::to_value(Configurations::default()).unwrap();
+        stored.as_object_mut().unwrap().remove("vwap");
+        let configs: Configurations = serde_json::from_value(stored).unwrap();
+        assert_eq!(configs.list(Kind::Vwap).len(), CONFIGURATIONS as usize);
+        assert!(configs.is_default(Kind::Vwap, 4));
+    }
+
+    /// A retracement is two anchors, moved whole and by either end, and the
+    /// tool is offered straight after the anchored VWAP.
+    #[test]
+    fn a_retracement_is_two_ends_moved_whole_or_by_either() {
+        let mut drawing = Drawing::new(Kind::Fib, Anchor::new(100, 10.0), Anchor::new(300, 20.0));
+        assert_eq!(drawing.grips(), vec![Grip::From, Grip::To]);
+        drawing.drag_grip(Grip::To, Anchor::new(400, 30.0));
+        assert_eq!((drawing.to.ts, drawing.to.price), (400, 30.0));
+        assert_eq!((drawing.from.ts, drawing.from.price), (100, 10.0), "the other end stays");
+        drawing.shift(50, 1.0);
+        assert_eq!((drawing.from.ts, drawing.from.price, drawing.to.price), (150, 11.0, 31.0));
+        assert!(!Kind::Fib.takes_text() && !Kind::Fib.reads_bars() && !Kind::Fib.one_anchor());
+        for key in ["fib", "FIB", "fibonacci", "retracement", "fib-retracement"] {
+            assert_eq!(Kind::from_key(key), Some(Kind::Fib), "{key}");
+        }
+        assert_eq!(Kind::ALL[Kind::ALL.len() - 2..], [Kind::Vwap, Kind::Fib]);
+    }
+
+    /// Direction follows the drag: 0 is where the hand let go and 1 where it
+    /// started, so a swing dragged up and one dragged down put 0.618 on
+    /// opposite sides of the middle.
+    #[test]
+    fn a_retracements_levels_follow_the_direction_it_was_drawn() {
+        let level = |ratio: f64| FibLevel::new(ratio);
+        // Up from 100 to 200: 0 at the top, 0.618 well below the half.
+        assert_eq!(level(0.0).price(100.0, 200.0), 200.0);
+        assert_eq!(level(1.0).price(100.0, 200.0), 100.0);
+        assert!((level(0.618).price(100.0, 200.0) - 138.2).abs() < 1e-9);
+        // Down from 200 to 100: the same ratio, above it.
+        assert!((level(0.618).price(200.0, 100.0) - 161.8).abs() < 1e-9);
+        assert_eq!(level(0.5).price(200.0, 100.0), 150.0);
+        let names: Vec<String> = fib_levels().iter().map(FibLevel::name).collect();
+        assert_eq!(names, ["0%", "23.6%", "38.2%", "50%", "61.8%", "78.6%", "100%"]);
+        assert_eq!(fib_ratio_name(1.272), "127.2%", "a level past the swing reads the same way");
+        assert_eq!(fib_ratio_name(-0.0), "0%");
+    }
+
+    /// Picked on a level or on the line between its ends, held by those ends,
+    /// and not picked in the empty space between two levels.
+    #[test]
+    fn a_retracement_is_picked_on_its_levels_and_held_by_its_ends() {
+        let projected = Projected::new(Kind::Fib, (100.0, 300.0), (300.0, 100.0))
+            .with_levels(vec![100.0, 150.0, 200.0, 250.0, 300.0]);
+        assert_eq!(projected.hit(100.0, 300.0), Some(Grip::From));
+        assert_eq!(projected.hit(300.0, 100.0), Some(Grip::To));
+        assert_eq!(projected.hit(260.0, 150.0), Some(Grip::Body), "on a level");
+        assert_eq!(projected.hit(200.0, 200.0), Some(Grip::Body), "on the line between the ends");
+        assert_eq!(projected.hit(260.0, 175.0), None, "between two levels");
+        assert_eq!(projected.hit(340.0, 150.0), None, "past the span");
+        assert!(projected.touches((250.0, 240.0, 20.0, 20.0)), "a box over a level takes it");
+        assert!(!projected.touches((250.0, 165.0, 20.0, 10.0)), "a box between levels does not");
+    }
+
+    /// One colour a configuration and nothing filled; none of them Up or
+    /// Down; the first is Ink, drawn soft: neither black nor white, and a
+    /// grey on every theme the app ships.
+    #[test]
+    fn the_nine_retracement_configurations_are_quiet_and_one_colour_each() {
+        let configs = Configurations::default();
+        assert_eq!(configs.list(Kind::Fib).len(), CONFIGURATIONS as usize);
+        for n in 1..=CONFIGURATIONS {
+            let style = configs.of(Kind::Fib, n);
+            assert!(style.fib.levels.iter().all(|level| level.colour.is_none()), "configuration {n}");
+            assert!(style.fib.fib_labels && !style.fib.price_labels, "configuration {n} labels ratios only");
+            assert!(
+                !matches!(style.colour, Paint::Preset { preset: Preset::Up | Preset::Down }),
+                "configuration {n} says up or down"
+            );
+        }
+        assert_eq!(configs.of(Kind::Fib, 1).colour, Paint::preset(Preset::Ink));
+        assert_eq!(configs.of(Kind::Fib, 2).colour, Paint::preset(Preset::Ink));
+        assert_eq!(configs.of(Kind::Fib, 4).colour, Paint::preset(Preset::Amber), "four is amber, as everywhere");
+        assert_ne!(configs.of(Kind::Fib, 1), configs.of(Kind::Fib, 2));
+        // The first, the one a new retracement takes, tells the levels apart
+        // by pattern; the second is the same, every level solid.
+        let patterns = |n: u8| -> Vec<LineStyle> {
+            configs.of(Kind::Fib, n).fib.levels.iter().map(|level| level.stroke.style).collect()
+        };
+        use LineStyle::{Dashed, Dotted, Solid};
+        assert_eq!(patterns(1), [Solid, Dotted, Dotted, Dashed, Dotted, Dotted, Solid]);
+        assert_eq!(patterns(2), [Solid; 7]);
+        assert_ne!(configs.of(Kind::Fib, 1), configs.of(Kind::Fib, 9));
+        for theme in crate::theme::builtin_themes() {
+            let bg = &theme.ui.background;
+            let drawn = mix(&colour(&theme, Preset::Ink), bg, 1.0 - FIB_ALPHA);
+            let ink = Oklch::of(&drawn).unwrap();
+            assert!(ink.c < 0.04, "{}: {drawn} has a hue", theme.name);
+            assert!((0.12..0.9).contains(&ink.l), "{}: {drawn} is black or white", theme.name);
+            assert!(contrast_ratio(&drawn, bg) >= 2.5, "{}: {drawn} is lost on {bg}", theme.name);
+        }
+    }
+
+    /// A line's stored style says nothing about a retracement; a
+    /// retracement's reads back as written; and a store from before the
+    /// kind, or with levels this build does not draw, opens with the seven.
+    #[test]
+    fn a_retracements_look_is_stored_and_read_back() {
+        let plain = serde_json::to_value(Style::line(Preset::Up)).unwrap();
+        assert!(plain.get("fib").is_none(), "{plain}");
+        let mut style = Style::fib(Preset::Teal);
+        style.fib.fib_labels = false;
+        style.fib.price_labels = true;
+        let level = style.fib.level_mut(0.618).unwrap();
+        level.colour = Some(Paint::fixed("#aabbcc"));
+        level.stroke = Stroke::new(2.5, LineStyle::Dashed);
+        style.fib.level_mut(0.236).unwrap().enabled = false;
+        let json = serde_json::to_string(&style).unwrap();
+        assert_eq!(serde_json::from_str::<Style>(&json).unwrap(), style);
+
+        let mut odd = serde_json::to_value(&style).unwrap();
+        odd["fib"]["levels"] = serde_json::json!([{ "ratio": 0.5, "enabled": true, "stroke": { "width": 1.0, "style": "solid" } }]);
+        let read: Style = serde_json::from_value(odd).unwrap();
+        assert_eq!(read.fib.levels, fib_levels());
+        assert!(!read.fib.fib_labels && read.fib.price_labels, "the rest of the look survives");
+
+        // Before the labels were two, one switch said both.
+        for (labels, both) in [(true, true), (false, false)] {
+            let mut old = serde_json::to_value(&style).unwrap();
+            let fib = old["fib"].as_object_mut().unwrap();
+            fib.remove("fib_labels");
+            fib.remove("price_labels");
+            fib.insert("labels".into(), labels.into());
+            let read: Style = serde_json::from_value(old).unwrap();
+            assert_eq!((read.fib.fib_labels, read.fib.price_labels), (both, both), "labels: {labels}");
+            assert_eq!(read.fib.levels, style.fib.levels);
+        }
+        let mut bare = serde_json::to_value(&style).unwrap();
+        bare["fib"] = serde_json::json!({});
+        let read: Style = serde_json::from_value(bare).unwrap();
+        assert_eq!(read.fib, FibLook::default(), "ratios only unless told otherwise");
+
+        let mut stored = serde_json::to_value(Configurations::default()).unwrap();
+        stored.as_object_mut().unwrap().remove("fib");
+        let configs: Configurations = serde_json::from_value(stored).unwrap();
+        assert_eq!(configs.list(Kind::Fib).len(), CONFIGURATIONS as usize);
+        assert!(configs.is_default(Kind::Fib, 2));
+    }
+
+    /// Every profile configuration is configuration 1's look in another
+    /// colour: four filled, the same four as outlines in the same order, and
+    /// a neutral outline from the right last.
+    #[test]
+    fn the_nine_profile_configurations_are_four_colours_filled_then_outlined() {
+        let configs = Configurations::default();
+        let profile = |n: u8| configs.of(Kind::Profile, n).clone();
+        for n in 1..=4u8 {
+            let (filled, outline) = (profile(n), profile(n + 4));
+            assert_eq!(filled.profile.shape, ProfileShape::Filled, "configuration {n}");
+            assert_eq!(outline.profile.shape, ProfileShape::Outline, "configuration {}", n + 4);
+            assert_eq!(outline.colour, filled.colour, "configuration {} outlines {n}", n + 4);
+            assert_eq!(filled.colour, Paint::preset(PROFILE_COLOURS[n as usize - 1]));
+            for style in [&filled, &outline] {
+                assert_eq!(style.profile.align, ProfileAlign::Left);
+            }
+            // Only the colour sets the filled ones apart from configuration 1.
+            let first = profile(1);
+            let recoloured = Style { colour: filled.colour.clone(), fill: filled.fill.clone(), text: filled.text.clone(), ..first };
+            assert_eq!(filled, recoloured, "configuration {n} is 1 in another colour");
+        }
+        let ninth = profile(9);
+        assert_eq!(ninth.colour, Paint::preset(Preset::Ink));
+        assert_eq!((ninth.profile.shape, ninth.profile.align), (ProfileShape::Outline, ProfileAlign::Right));
+        assert!((1..=9).all(|n| profile(n).profile.poc == Paint::preset(Preset::Ink)));
+    }
+
+    /// A profile says nothing about direction, so none of the nine is in the
+    /// candles' colours, or in the two that pass for them on some themes.
+    #[test]
+    fn no_profile_configuration_is_green_or_red() {
+        let configs = Configurations::default();
+        let colours: Vec<_> = (1..=9).map(|n| configs.of(Kind::Profile, n).colour.clone()).collect();
+        for preset in [Preset::Up, Preset::Down, Preset::Teal, Preset::Orange] {
+            assert!(!colours.contains(&Paint::preset(preset)), "{} is a profile colour", preset.name());
+        }
+        // Four colours and a neutral.
+        let unique: std::collections::BTreeSet<_> = colours.iter().map(Paint::spell).collect();
+        assert_eq!(unique.len(), 5);
+    }
+
+    /// A store written before the profile's nine changed keeps every one
+    /// somebody edited, and reads the ones nobody touched as they ship now.
+    #[test]
+    fn stored_profile_configurations_keep_edits_and_take_the_new_defaults() {
+        let mut stored = Configurations {
+            profile: (1..=CONFIGURATIONS).map(Style::profile_as_first_shipped).collect(),
+            ..Configurations::default()
+        };
+        let edited = Style { width: 3.0, ..Style::profile_as_first_shipped(2) };
+        stored.profile[1] = edited.clone();
+        let json = serde_json::to_string(&stored).unwrap();
+        let read: Configurations = serde_json::from_str(&json).unwrap();
+        assert_eq!(read.of(Kind::Profile, 2), &edited, "an edit is the user's");
+        for n in (1..=9).filter(|&n| n != 2) {
+            assert!(read.is_default(Kind::Profile, n), "configuration {n} as it ships now");
+        }
+        // Other kinds are as they were.
+        assert_eq!(read.of(Kind::Rect, 1), &Style::rect(Preset::Up));
     }
 }

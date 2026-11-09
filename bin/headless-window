@@ -10,7 +10,7 @@
 #
 #   eval "$(bin/headless-window start)"
 #   bin/headless-window app
-#   bin/headless-window key ctrl+b
+#   bin/headless-window key ctrl+shift+b
 #   bin/headless-window click 753 24
 #   bin/headless-window shot /tmp/after.png
 #   bin/headless-window stop
@@ -35,7 +35,7 @@ headless-window — drive omacharts inside a compositor with no screen
   app [ARG...]                     launch the built binary inside; prints its pid
   cli ARG...                       run a command against that same window
   run CMD [ARG...]                 run anything inside the session
-  key CHORD...                     ctrl+b, Escape, question, ctrl+shift+s
+  key CHORD...                     ctrl+shift+b, Escape, question, ctrl+shift+s
   type TEXT                        type literal text
   move X Y                         move the pointer, pressing nothing
   click X Y                        press and release where it lands
@@ -150,7 +150,7 @@ EOF
   (
     unset WAYLAND_DISPLAY DISPLAY HYPRLAND_INSTANCE_SIGNATURE SWAYSOCK
     export XDG_RUNTIME_DIR="$dir"
-    export WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_RENDERER=gles2
+    export WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_RENDERER="${WLR_RENDERER:-gles2}"
     exec sway -c "$dir/sway.conf"
   ) > "$dir/sway.log" 2>&1 < /dev/null &
   remember $! sway
@@ -169,12 +169,7 @@ EOF
   # owns the application id on the session bus, so a test run that keeps the
   # owner's bus reaches the window he is looking at however disposable its
   # data directory is.
-  # Through two files rather than a pipe: the daemon closes each descriptor
-  # as soon as it has written to it, so the address and the pid cannot share
-  # one, and anything of this process's that it keeps open is something
-  # `$(headless-window start)` then waits on for ever.
-  dbus-daemon --session --print-address=3 --print-pid=4 --fork \
-    3>"$dir/bus-address" 4>"$dir/bus-pid" >/dev/null 2>&1 </dev/null
+  "$here/private-bus" --fork "$dir"
 
   cat > "$dir/env" <<EOF
 XDG_RUNTIME_DIR=$dir
@@ -280,6 +275,14 @@ app() {
 # and another between the modifier and what it modifies. They cost a third
 # of a second and they are the difference between a key that lands and one
 # that lands four times out of five.
+#
+# And a letter with Shift goes as the capital it would type. wtype's keymap
+# has one level per key, so `-M shift -k b` holds Shift and still delivers
+# `b` — and `-k B` is no better, since it looks names up ignoring case. A real
+# keyboard delivers `B` there, and GTK matches `<Ctrl><Shift>b` by
+# uppercasing its letter and comparing that with what arrived, so every
+# Ctrl+Shift accelerator went unanswered in here while working on a desk.
+# Typed as text, the capital is its own keysym, and arrives as one.
 keys() {
   local dir; dir="$(session)"
   local args=(-s 300) chord parts=() key mod
@@ -289,7 +292,11 @@ keys() {
     unset 'parts[-1]'
     for mod in "${parts[@]}"; do args+=(-M "$mod"); done
     [ ${#parts[@]} -gt 0 ] && args+=(-s 120)
-    args+=(-k "$key" -s 120)
+    if [[ " ${parts[*],,} " == *" shift "* && "$key" =~ ^[a-zA-Z]$ ]]; then
+      args+=("${key^^}" -s 120)
+    else
+      args+=(-k "$key" -s 120)
+    fi
     for mod in "${parts[@]}"; do args+=(-m "$mod"); done
   done
   load_env "$dir"

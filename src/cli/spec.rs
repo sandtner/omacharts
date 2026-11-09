@@ -116,7 +116,7 @@ pub const LAUNCH: &[Launch] = &[
 /// Everything `--long` accepts, including the sets this table defers on.
 pub fn launch_values(long: &str) -> Vec<&'static str> {
     match long {
-        "provider" => omacharts_engine::providers::LISTED.iter().map(|feed| feed.id).collect(),
+        "provider" => omacharts_engine::providers::offered().map(|feed| feed.id).collect(),
         _ => LAUNCH
             .iter()
             .find(|option| option.long == long)
@@ -177,6 +177,71 @@ pub struct Noun {
 /// of the exceptions with the reason written on it.
 pub const IN_THE_CALLER: &[(&str, &str)] = &[("provider", "login"), ("provider", "logout")];
 
+/// The groups the parser accepts and no listing shows: not `--help`, not
+/// `surface --json`, not the completions, the man page or the skill, all of
+/// which are built from [`SURFACE`] alone. For what is switched on to try
+/// before it is offered to everybody, and so must not be advertised; see
+/// [`crate::features`].
+pub const HIDDEN: &[Noun] = &[Noun {
+    name: "features",
+    about: "Experimental parts of the app, switched on or off",
+    local: false,
+    verbs: &[
+        Verb {
+            name: "list",
+            about: "Every feature flag, and whether it is on",
+            args: &[],
+            flags: &[],
+            example: "omacharts features list",
+            json: true,
+            writes: false,
+            workspace: false,
+        },
+        Verb {
+            name: "enable",
+            about: "Switch a feature on, in an open window at once",
+            args: &[Arg::req("FEATURE", "a feature's name, from `features list`")],
+            flags: &[],
+            example: "omacharts features enable trading",
+            json: true,
+            writes: false,
+            workspace: false,
+        },
+        Verb {
+            name: "disable",
+            about: "Switch a feature off, in an open window at once",
+            args: &[Arg::req("FEATURE", "a feature's name, from `features list`")],
+            flags: &[],
+            example: "omacharts features disable trading",
+            json: true,
+            writes: false,
+            workspace: false,
+        },
+    ],
+}];
+
+/// Verbs of listed groups that the parser accepts and no listing shows, as
+/// [`HIDDEN`] does for whole groups: for a verb only an experimental part
+/// of the app has a use for. `provider setup` sets up a feed that reads
+/// something on this machine, and the only one is Sierra Chart's, behind
+/// its feature flag; with the flag off it knows no such feed.
+pub const HIDDEN_VERBS: &[(&str, Verb)] = &[(
+    "provider",
+    Verb {
+        name: "setup",
+        about: "Set up a feed that reads something on this machine and add it; with no values, it is looked for",
+        args: &[
+            Arg::req("NAME", "the feed to set up"),
+            Arg::any("VALUE", "what it is set up with, as KEY=VALUE"),
+        ],
+        flags: &[],
+        example: "omacharts provider setup sierra folder=~/SierraChart port=11099",
+        json: true,
+        writes: true,
+        workspace: false,
+    },
+)];
+
 /// How a watchlist, section or chartbook is named on the command line.
 pub const SELECTOR: &str =
     "a name, case-insensitive, or `id:N` when two of them share one";
@@ -200,9 +265,11 @@ pub const CHART_SELECTOR: &str =
     "`pos:N`, counting from 0 in layout order, or a raw id from `chart list` \
      — prefer the position, which survives the window rebuilding";
 
-/// How a chart paints the theme's candle colours, spelled as the scheme ids
-/// the settings store.
-const COLOURINGS: &[&str] = &["theme", "theme-hollow", "theme-red-up", "theme-mono"];
+/// The palette a chart paints its bars from, spelled as the scheme ids the
+/// settings store, plus the two a released version offered for a hollow
+/// rise and for red up, which are Vivid with that switch on.
+const COLOURINGS: &[&str] =
+    &["theme", "theme-soft", "theme-quiet", "theme-mono", "theme-hollow", "theme-red-up"];
 const STYLES: &[&str] = &["candles", "ohlc", "none"];
 const SESSIONS: &[&str] = &["regular", "extended"];
 const SPLITS: &[&str] = &["horizontal", "vertical"];
@@ -214,9 +281,19 @@ const KINDS: &[&str] = &[
 const RANGE_PRESETS: &[&str] = &["eth", "rth", "asia", "london", "new_york", "custom"];
 const ANCHORS: &[&str] = &["session", "week", "month", "quarter", "year"];
 const LINE_STYLES: &[&str] = &["solid", "dashed", "dotted"];
+const PROFILE_STYLES: &[&str] = &["filled", "outline"];
+const PROFILE_ALIGNS: &[&str] = &["left", "right"];
+const VWAP_SOURCES: &[&str] = &["hlc3", "hl2", "ohlc4", "close"];
 const SWITCHES: &[&str] = &["on", "off"];
 const LINKS: &[&str] = &["focus", "follow", "pinned"];
-const COLOURING: &[&str] = &["coloured", "red-up", "monochrome"];
+/// The answers `config bars` gives and takes. `coloured`, `hollow` and
+/// `red-up` are what a released version took: `coloured` is `vivid`, and the
+/// other two are `vivid` with that switch on, on every chart.
+const COLOURING: &[&str] = &["vivid", "soft", "quiet", "monochrome", "coloured", "hollow", "red-up"];
+/// What a volume pane's bars may be painted from: the chart's own colouring,
+/// or one of the four palettes.
+const VOLUME_COLOURINGS: &[&str] =
+    &["chart", "theme", "theme-soft", "theme-quiet", "theme-mono"];
 const SORT_COLUMNS: &[&str] = &["symbol", "last", "change", "change_pct", "none"];
 /// The kinds a drawing comes in, plus the one alias.
 ///
@@ -227,7 +304,7 @@ const SORT_COLUMNS: &[&str] = &["symbol", "last", "change", "change_pct", "none"
 /// list before the parser sees anything, so an alias the engine understands
 /// and the table does not is an alias nobody can use.
 const DRAWING_KINDS: &[&str] =
-    &["line", "hline", "arrow", "zigzag", "rect", "ellipse", "circle", "text", "position", "long", "short"];
+    &["line", "hline", "arrow", "zigzag", "rect", "ellipse", "circle", "text", "position", "long", "short", "profile", "vp", "avwap", "vwap", "fib", "fibonacci", "retracement", "fib-retracement"];
 /// Where a figure's label sits in it.
 const PLACES: &[&str] = &[
     "center", "top", "bottom", "left", "right", "top-left", "top-right", "bottom-left",
@@ -303,8 +380,16 @@ const INDICATOR_FLAGS: &[Flag] = &[
     Flag::valued("rows", "N", "volume profile rows, or `auto` to follow the instrument's own increment"),
     Flag::valued("value-area", "F", "the share of volume the value area covers, 0-1"),
     Flag::valued("poc-color", "COLOUR", "the volume profile's point of control"),
+    Flag::valued("profile-style", "HOW", "volume profile rows filled, or only their outline").of(PROFILE_STYLES),
+    Flag::valued("align", "EDGE", "the edge of its period a volume profile grows from").of(PROFILE_ALIGNS),
+    Flag::valued("outline", "BOOL", "whether a filled volume profile wears an outline").of(SWITCHES),
+    Flag::valued("outline-color", "COLOUR", "a volume profile's outline"),
+    Flag::valued("outline-width", "F", "a volume profile's outline thickness in pixels"),
+    Flag::valued("poc-width", "F", "a volume profile's point of control thickness in pixels"),
     Flag::valued("up-color", "COLOUR", "volume bars of a rising session"),
     Flag::valued("down-color", "COLOUR", "volume bars of a falling session"),
+    Flag::valued("colouring", "COLOURING", "how volume bars are painted: as the chart paints its candles, or a colouring of their own").of(VOLUME_COLOURINGS),
+    Flag::valued("opacity", "F", "how solid volume bars are drawn, 0.2-1; 1 is fully opaque"),
     Flag::valued("d-color", "COLOUR", "the stochastic's %D line"),
     Flag::valued("color", "COLOUR", "the line, the volume profile's background, or a Session Times range's shading"),
     Flag::valued("width", "F", "line thickness; 0 draws no line at all"),
@@ -422,6 +507,16 @@ pub const SURFACE: &[Noun] = &[
                 ],
                 flags: &[],
                 example: "omacharts symbol show SAP DE",
+                json: true,
+                writes: false,
+                workspace: false,
+            },
+            Verb {
+                name: "contracts",
+                about: "The dated contracts of a futures root, soonest first, with the front month marked",
+                args: &[Arg::req("ROOT", "a futures root, such as ES")],
+                flags: &[],
+                example: "omacharts symbol contracts ES",
                 json: true,
                 writes: false,
                 workspace: false,
@@ -868,17 +963,22 @@ pub const SURFACE: &[Noun] = &[
                 flags: &[
                     Flag::valued("book", "BOOK", "which chartbook (default: the open one)"),
                     Flag::valued("chart", "CHART", CHART_SELECTOR),
+                    Flag::valued("title", "TITLE", "the chart title, shown in its header; \"\" for none"),
                     Flag::valued("symbol", "SYMBOL", "the instrument to chart, such as AAPL or 2330.TW"),
                     Flag::valued("suffix", "S", "its venue suffix, for a listing abroad"),
                     Flag::valued("resolution", "TF", "such as 5m, 1h, 1D, 1W, 1M, 1Y"),
                     Flag::valued("style", "STYLE", "how bars are drawn, or `none` to hide them").of(STYLES),
+                    Flag::valued("thickness", "PX", "how many pixels wide OHLC bars are drawn, from 1 to 4"),
                     Flag::valued(
                         "bars",
                         "BOOL",
                         "hide the bars, or show them again in the style they had",
                     )
                     .of(SWITCHES),
-                    Flag::valued("colouring", "COLOURING", "how the theme's candle colours are painted").of(COLOURINGS),
+                    Flag::valued("colouring", "COLOURING", "which of the theme's palettes the bars are painted from").of(COLOURINGS),
+                    Flag::valued("hollow-up", "BOOL", "draw a rising body as an outline").of(SWITCHES),
+                    Flag::valued("swap-colours", "BOOL", "swap the colouring's up and down, red for a rise")
+                        .of(SWITCHES),
                     Flag::valued("session", "SESSION", "which hours to include").of(SESSIONS),
                     Flag::valued(
                         "link",
@@ -948,7 +1048,7 @@ pub const SURFACE: &[Noun] = &[
                 args: &[
                     Arg::req("ACTION", "what to do")
                         .of(&["list", "add", "set", "remove", "clear", "configs", "configure", "reset-configs"]),
-                    Arg::opt("KIND", "a line or a box between two anchors, a circle in the box they make, or words at the first")
+                    Arg::opt("KIND", "a line or a box between two anchors, a circle in the box they make, a volume profile of the bars between them, words at the first, an anchored VWAP from the first, or a Fibonacci retracement of the swing from the first to the second")
                         .of(DRAWING_KINDS),
                 ],
                 flags: &[
@@ -965,10 +1065,10 @@ pub const SURFACE: &[Noun] = &[
                     ),
                     Flag::valued("config", "N", "the configuration, 1-9, a drawing follows, or the one to configure"),
                     Flag::valued("color", "COLOUR", "a line's colour, or a box's edge: a preset name or #rrggbb"),
-                    Flag::valued("width", "F", "a line's thickness in pixels, or a box's edge"),
+                    Flag::valued("width", "F", "a line's thickness in pixels, or a box's edge, or every level of a retracement; 0 leaves an anchored VWAP only its bands"),
                     Flag::valued("arrow", "WHERE", "which ends of a line wear an arrowhead").of(ARROWS),
                     Flag::valued("head", "SHAPE", "the arrowhead's shape").of(HEADS),
-                    Flag::valued("border", "BOOL", "whether a box has an edge").of(SWITCHES),
+                    Flag::valued("border", "BOOL", "whether a box has an edge, or a filled volume profile an outline").of(SWITCHES),
                     Flag::valued("fill", "COLOUR", "what a box is filled with: a preset name or #rrggbb"),
                     Flag::valued("alpha", "F", "how much of a box's fill shows, 0-1"),
                     Flag::valued("scope", "SCOPE", "who else sees it (default: shared, unless the chart does not send)")
@@ -979,6 +1079,29 @@ pub const SURFACE: &[Noun] = &[
                     Flag::valued("text-color", "COLOUR", "the words' colour: a preset name or #rrggbb"),
                     Flag::valued("font", "FAMILY", "the words' font family; `system` for the desktop's own"),
                     Flag::valued("font-size", "F", "the words' size in pixels"),
+                    Flag::valued("poc-color", "COLOUR", "a volume profile's point of control: a preset name or #rrggbb"),
+                    Flag::valued("profile-style", "HOW", "a volume profile's rows filled, or only their outline").of(PROFILE_STYLES),
+                    Flag::valued("align", "EDGE", "the edge of its span a volume profile grows from").of(PROFILE_ALIGNS),
+                    Flag::valued("value-area", "F", "the share of a volume profile's volume its value area holds, 0.1-1"),
+                    Flag::valued("transparency", "F", "how far a volume profile's outline and background fade, 0-1"),
+                    Flag::valued("poc-width", "F", "a volume profile's point of control thickness in pixels; --width is its outline's"),
+                    Flag::valued("source", "PRICE", "the price an anchored VWAP weights by volume").of(VWAP_SOURCES),
+                    Flag::valued("style", "STYLE", "how an anchored VWAP's line is drawn").of(LINE_STYLES),
+                    Flag::valued("bands", "LIST", "which of an anchored VWAP's bands are drawn: any of 1, 2 and 3, comma-separated, or none"),
+                    Flag::valued("band", "N", "the anchored VWAP band, 1-3, the --band-* flags change (default: every one)"),
+                    Flag::valued("band-deviations", "F", "how far out the --band sits, in standard deviations, 0.1-6"),
+                    Flag::valued("band-shaded", "BOOL", "whether a band shades the area between its edges").of(SWITCHES),
+                    Flag::valued("band-alpha", "F", "how solid a band's shading is, 0-1"),
+                    Flag::valued("band-color", "COLOUR", "a band's colour: a preset name, #rrggbb, or `line` for the line's own"),
+                    Flag::valued("band-width", "F", "the thickness of a band's edges in pixels; 0 draws none"),
+                    Flag::valued("band-style", "STYLE", "how a band's edges are drawn").of(LINE_STYLES),
+                    Flag::valued("levels", "LIST", "which of a Fibonacci retracement's levels are drawn: any of 0, 0.236, 0.382, 0.5, 0.618, 0.786 and 1, or the same as percentages (61.8%), comma-separated, all, or none"),
+                    Flag::valued("level", "RATIO", "the retracement level, such as 0.618, the --level-* flags change (default: every one)"),
+                    Flag::valued("level-color", "COLOUR", "a level's colour: a preset name, #rrggbb, or `drawing` for the drawing's own"),
+                    Flag::valued("level-width", "F", "a level's thickness in pixels"),
+                    Flag::valued("level-style", "STYLE", "how a level is drawn").of(LINE_STYLES),
+                    Flag::valued("fib-labels", "BOOL", "whether a retracement's levels are labelled with their ratio, as 61.8% (on unless set)").of(SWITCHES),
+                    Flag::valued("price-labels", "BOOL", "whether a retracement's levels are labelled with their price (off unless set)").of(SWITCHES),
                 ],
                 example: "omacharts chart drawing add line --from 2026-09-01,180.5 --to 2026-09-19,192 --config 4",
                 json: true,
@@ -1000,8 +1123,22 @@ pub const SURFACE: &[Noun] = &[
                 workspace: false,
             },
             Verb {
+                name: "profile",
+                about: "List the focused chart's volume profiles, merge one at a moment into the one before it, or split a composite back into its periods; requires a window",
+                args: &[Arg::req("ACTION", "what to do").of(&["list", "merge", "split"])],
+                flags: &[
+                    Flag::switch("on-screen", "for list: only the profiles on screen"),
+                    Flag::valued("at", "WHEN", "for merge and split, a moment inside the profile: 2026-09-01 or 2026-09-01T14:30, in the chart's clock"),
+                    Flag::valued("id", "N", "which volume profile, when the chart has more than one"),
+                ],
+                example: "omacharts chart profile merge --at 2026-09-02",
+                json: true,
+                writes: true,
+                workspace: false,
+            },
+            Verb {
                 name: "crosshair",
-                about: "Whether a pointer on a Follow chart draws a line on the other Follow charts",
+                about: "Whether a pointer on a chart draws a line on the other charts of the same symbol",
                 args: &[Arg::opt("STATE", "omit to read it").of(SWITCHES)],
                 flags: &[],
                 example: "omacharts chart crosshair off",
@@ -1248,7 +1385,7 @@ pub const SURFACE: &[Noun] = &[
             },
             Verb {
                 name: "bars",
-                about: "Whether bars carry their direction in colour, red for up, or no colour at all",
+                about: "Which palette every chart paints its bars from: vivid, soft, quiet or monochrome; and whether a rise is hollow or up and down are swapped",
                 args: &[Arg::opt("STATE", "omit to read it").of(COLOURING)],
                 flags: &[],
                 example: "omacharts config bars monochrome",
@@ -1573,6 +1710,48 @@ pub const SURFACE: &[Noun] = &[
             },
         ],
     },
+    Noun {
+        name: "update",
+        about: "Newer releases, downloaded and used from the next launch",
+        // In the process it was typed in: a download is minutes on a slow
+        // line, and a command handed to the window runs inside its main loop.
+        // None of its verbs reads the database.
+        local: true,
+        verbs: &[
+            Verb {
+                name: "check",
+                about: "Ask GitHub for the newest release, and say whether it is newer. Downloads nothing",
+                args: &[],
+                flags: &[],
+                example: "omacharts update check --json",
+                json: true,
+                writes: false,
+                workspace: false,
+            },
+            Verb {
+                name: "download",
+                about: "Download the newest release now, whatever Preferences says; the next launch uses it",
+                args: &[],
+                flags: &[],
+                example: "omacharts update download",
+                json: true,
+                writes: false,
+                workspace: false,
+            },
+            Verb {
+                name: "reset",
+                about: "Remove every download and every mark, so the next launch runs the installed version \
+                        and a version given up on can be downloaded again. A newer version that has already \
+                        run is kept, since it may have migrated the settings",
+                args: &[],
+                flags: &[Flag::switch("all", "remove that one too; the settings may need a backup put back")],
+                example: "omacharts update reset",
+                json: true,
+                writes: false,
+                workspace: false,
+            },
+        ],
+    },
 ];
 
 /// The values this table offers have to be the values the engine accepts.
@@ -1583,12 +1762,8 @@ pub const SURFACE: &[Noun] = &[
 /// only ever fail.
 /// Find a verb by the pair of names the parser matched.
 pub fn verb(noun: &str, verb: &str) -> Option<&'static Verb> {
-    SURFACE
-        .iter()
-        .find(|n| n.name == noun)?
-        .verbs
-        .iter()
-        .find(|v| v.name == verb)
+    let listed = SURFACE.iter().chain(HIDDEN).find(|n| n.name == noun).and_then(|n| n.verbs.iter().find(|v| v.name == verb));
+    listed.or_else(|| HIDDEN_VERBS.iter().find(|(n, v)| *n == noun && v.name == verb).map(|(_, v)| v))
 }
 
 /// What a chart and a chartbook are stored with, and what reaches each one.
@@ -1601,6 +1776,7 @@ pub fn verb(noun: &str, verb: &str) -> Option<&'static Verb> {
 #[cfg(test)]
 const STORED_FIELDS: &[(&str, &str, &str)] = &[
     ("id", "", "identity rather than state: a chart is named back as pos:N"),
+    ("title", "chart set", "--title"),
     ("symbol", "chart set", "--symbol"),
     ("suffix", "chart set", "--suffix"),
     ("timeframe", "chart set", "--resolution"),
@@ -1608,6 +1784,9 @@ const STORED_FIELDS: &[(&str, &str, &str)] = &[
     ("bar_style", "chart set", "--style"),
     ("bars_hidden", "chart set", "--bars"),
     ("colouring", "chart set", "--colouring"),
+    ("swapped", "chart set", "--swap-colours"),
+    ("hollow_up", "chart set", "--hollow-up"),
+    ("ohlc_thickness", "chart set", "--thickness"),
     ("session", "chart set", "--session"),
     ("show_grid", "chart set", "--grid"),
     ("link", "chart set", "--link"),
@@ -1624,6 +1803,25 @@ const STORED_FIELDS: &[(&str, &str, &str)] = &[
     ("template", "chart set", "--template"),
     ("indicators_shown", "chart set", "--indicators"),
     ("drawings_shown", "chart set", "--drawings"),
+    ("profile_merges", "chart profile", ""),
+    (
+        "source",
+        "",
+        "exploratory: which data source a chart is pinned to is chosen from its header for now, \
+         and the command comes with the feature shipping",
+    ),
+    (
+        "account",
+        "",
+        "exploratory: which trading account a chart is on is chosen from its header for now, \
+         and the command comes with the feature shipping",
+    ),
+    (
+        "trading_size",
+        "",
+        "exploratory: a chart's quantity is picked from its header or with Ctrl and a digit for now, \
+         and the command comes with trading shipping",
+    ),
     ("name", "chartbook rename", ""),
     ("layout", "chart split", ""),
     ("focused", "chart focus", ""),
@@ -1702,6 +1900,14 @@ mod tests {
                 kind.key()
             );
         }
+    }
+
+    /// The price sources an anchored VWAP offers, against the engine's.
+    #[test]
+    fn the_vwap_sources_on_offer_are_the_ones_that_exist() {
+        use omacharts_engine::drawings::VwapSource;
+        let engine: Vec<&str> = VwapSource::ALL.iter().map(|s| s.key()).collect();
+        assert_eq!(VWAP_SOURCES, engine.as_slice());
     }
 
     /// And the places a label can sit, the same way.

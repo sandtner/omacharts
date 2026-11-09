@@ -33,8 +33,9 @@ crop: 2000,0,560,800
 
 ## The sidebar
 
-<kbd>Ctrl</kbd> + <kbd>B</kbd> shows or hides the sidebar and puts the
-keyboard in it ([The window](/manual/window/)). Drag its edge to make it
+<kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>B</kbd> shows or hides the sidebar and puts the
+keyboard in it ([The window](/manual/window/)), as does **Sidebars** › **Watchlist** in the
+chart menu. Drag its edge to make it
 wider or narrower. Whether it is open, and how wide, is saved with each
 chartbook.
 
@@ -165,7 +166,7 @@ From anywhere:
 | Key | Does |
 |---|---|
 | <kbd>↑</kbd> <kbd>↓</kbd> / <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>↑</kbd> <kbd>↓</kbd> | Over a chart, the previous or next symbol in the list, without going to the sidebar. It puts the symbol on the focused chart, as typing it would ([Link modes](#link-modes)). On a pinned chart it steps the sidebar instead, as a click there would. A selected drawing takes <kbd>↑</kbd> <kbd>↓</kbd> first, to nudge it. |
-| <kbd>Ctrl</kbd> + <kbd>1</kbd> … <kbd>9</kbd> | Shows watchlist N, counting down the page of watchlists. |
+| <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>1</kbd> … <kbd>9</kbd> | Shows watchlist N, counting down the page of watchlists, on the number row whatever your layout prints on it with Shift held. |
 
 ## Linking charts to the watchlist
 
@@ -246,14 +247,6 @@ crop: 0,0,1120,370
 The chain appears once there is a second chart. With one chart, Focus and
 Follow do the same thing. A lone chart shows the chain only while it is
 pinned.
-
-### The crosshair across Follow charts
-
-The pointer on a Follow chart draws the same moment on the other Follow
-charts, at their own resolutions. Focus and Pinned charts are left alone.
-**Crosshair across Follow charts** in [Chart settings](/manual/chart-settings/)
-(<kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>S</kbd>) turns it off or on for the
-whole window. It is on by default.
 
 ## See also
 
