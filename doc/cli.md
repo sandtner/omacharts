@@ -445,8 +445,12 @@ Every command takes `--json` when you would rather parse it:
 ```
 $ omacharts watchlist show Semis --json
 {"id":3,"name":"Semis","sections":[{"id":7,"name":"","root":true,"collapsed":false,
-"symbols":[{"symbol":"NVDA","suffix":null,"display":"NVDA"}, ...]}]}
+"symbols":[{"symbol":"NVDA","suffix":null,"display":"NVDA","yahoo":"NVDA"}, ...]}]}
 ```
+
+`yahoo` is the symbol as Yahoo Finance spells it (`BZ=F` for `BZ`, `BTC-USD` for
+`BTC`, `^GDAXI` for `GDAXI`), for a tool that asks Yahoo itself, such as a ticker
+in the bar; `null` for an instrument Yahoo does not carry.
 
 ## Putting a watchlist in order
 
@@ -997,7 +1001,13 @@ poll for them:
 
 So with the window closed, an alert depends on the bar widget being
 installed (`omacharts plugin install`). Without the widget, run
-`omacharts alert check` from a timer of your own. Armed alerts are drawn on
+`omacharts alert check` from a timer. `packaging/systemd/` has one, every two
+minutes, which does not depend on the bar at all:
+
+```sh
+systemctl --user link ~/Code/omacharts/packaging/systemd/omacharts-alerts.service
+systemctl --user enable --now ~/Code/omacharts/packaging/systemd/omacharts-alerts.timer
+``` Armed alerts are drawn on
 their charts as dotted amber lines, two for a channel. A rule has no level,
 so it draws no line.
 

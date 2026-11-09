@@ -1538,7 +1538,7 @@ pub const SURFACE: &[Noun] = &[
             },
             Verb {
                 name: "check",
-                about: "Fetch what is due for the alerts' symbols and check every armed alert now; the bar widget's poll does this on its own",
+                about: "Fetch what is due for the alerts' symbols and check every armed alert now; the bar widget's poll, or the timer in packaging/systemd, does this on its own",
                 args: &[],
                 flags: &[],
                 example: "omacharts alert check",

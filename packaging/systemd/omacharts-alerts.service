@@ -1,0 +1,12 @@
+[Unit]
+Description=Check the omacharts price and rule alerts
+Documentation=file://%h/Code/omacharts/doc/cli.md
+
+[Service]
+Type=oneshot
+# The built binary, not bin/omacharts: that wrapper rebuilds the working tree
+# first, and a timer must not start a cargo build, or pop up "build failed"
+# every two minutes. With a window open, the command is handed to it.
+ExecStart=%h/Code/omacharts/target/release/omacharts alert check
+Nice=10
+TimeoutStartSec=90

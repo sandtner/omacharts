@@ -607,6 +607,11 @@ fn watchlist_show(store: &Store, m: &clap::ArgMatches, as_json: bool) -> Result<
 }
 
 fn sections_json(sections: &[Section]) -> Value {
+    // Each symbol as Yahoo spells it too (`BZ=F`, `BTC-USD`, `^GDAXI`), so a
+    // tool outside the app that asks Yahoo itself, such as a ticker in the
+    // bar, can read a watchlist without knowing the app's own names.
+    let index = crate::inventory::everything();
+    let yahoo = omacharts_engine::providers::built_or_default("yahoo");
     Value::Array(
         sections
             .iter()
@@ -620,6 +625,9 @@ fn sections_json(sections: &[Section]) -> Value {
                         "symbol": e.symbol,
                         "suffix": e.suffix,
                         "display": spell(&e.symbol, e.suffix.as_deref()),
+                        "yahoo": index
+                            .find(&e.symbol, e.suffix.as_deref())
+                            .and_then(|instrument| yahoo.symbol_for(instrument)),
                     })).collect::<Vec<_>>(),
                 })
             })
@@ -5478,6 +5486,7 @@ fn alert_json(alert: &omacharts_engine::alert::Alert) -> Value {
     value["armed"] = json!(state == omacharts_engine::alert::State::Armed);
     value["state"] = json!(state.key());
     value["display"] = json!(alert.spell_symbol());
+    value["summary"] = json!(alert_describe(alert));
     value
 }
 
